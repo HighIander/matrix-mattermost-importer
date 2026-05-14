@@ -13,6 +13,10 @@
   const MATTERMOST_CONTENT_KEY = "de.tkluge.mattermost_import";
   const DUPLICATE_HISTORY_LIMIT = 10000;
   const DUPLICATE_HISTORY_PAGE_SIZE = 100;
+  const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 12;
+  const RATE_LIMIT_RETRY_DEFAULT_MS = 5000;
+  const RATE_LIMIT_RETRY_MAX_MS = 300000;
+  const RATE_LIMIT_RETRY_HEARTBEAT_MS = 30000;
 
   let lastSession = null;
   let installed = false;
@@ -380,6 +384,169 @@
     }, window.location.origin);
   }
 
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function errorMessage(error) {
+    return error?.message || error?.data?.error || error?.response?.data?.error || String(error);
+  }
+
+  function headerValue(headers, name) {
+    if (!headers) return "";
+
+    try {
+      if (typeof headers.get === "function") {
+        return headers.get(name) || headers.get(name.toLowerCase()) || "";
+      }
+    } catch {}
+
+    const lowerName = name.toLowerCase();
+
+    try {
+      for (const [key, value] of Object.entries(headers)) {
+        if (String(key).toLowerCase() === lowerName) return value;
+      }
+    } catch {}
+
+    return "";
+  }
+
+  function retryAfterHeaderMs(value) {
+    const text = String(value || "").trim();
+    if (!text) return 0;
+
+    const seconds = Number(text);
+    if (Number.isFinite(seconds)) return seconds * 1000;
+
+    const timestamp = Date.parse(text);
+    if (Number.isFinite(timestamp)) return timestamp - Date.now();
+
+    return 0;
+  }
+
+  function numericRetryAfterMs(error) {
+    const candidates = [
+      error?.retry_after_ms,
+      error?.retryAfterMs,
+      error?.data?.retry_after_ms,
+      error?.data?.retryAfterMs,
+      error?.response?.data?.retry_after_ms,
+      error?.response?.data?.retryAfterMs
+    ];
+
+    for (const candidate of candidates) {
+      const value = Number(candidate);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+
+    return 0;
+  }
+
+  function statusCode(error) {
+    const candidates = [
+      error?.httpStatus,
+      error?.statusCode,
+      error?.status,
+      error?.data?.status,
+      error?.response?.status,
+      error?.xhr?.status
+    ];
+
+    for (const candidate of candidates) {
+      const value = Number(candidate);
+      if (Number.isFinite(value)) return value;
+    }
+
+    return 0;
+  }
+
+  function isRateLimitError(error) {
+    const errcodes = [
+      error?.errcode,
+      error?.name,
+      error?.data?.errcode,
+      error?.response?.data?.errcode
+    ].map(value => String(value || "").toUpperCase());
+
+    if (errcodes.includes("M_LIMIT_EXCEEDED")) return true;
+    if (statusCode(error) === 429) return true;
+
+    const message = errorMessage(error).toLowerCase();
+    return message.includes("m_limit_exceeded") ||
+      message.includes("too many requests") ||
+      message.includes("rate limit") ||
+      message.includes("rate-limited") ||
+      message.includes("ratelimited");
+  }
+
+  function retryDelayMs(error, attempt) {
+    const headerRetryAfter = retryAfterHeaderMs(
+      headerValue(error?.headers, "retry-after") ||
+      headerValue(error?.response?.headers, "retry-after") ||
+      headerValue(error?.xhr?.headers, "retry-after")
+    );
+
+    const serverDelay = numericRetryAfterMs(error) || headerRetryAfter;
+    const fallbackDelay = RATE_LIMIT_RETRY_DEFAULT_MS * Math.pow(2, Math.max(0, attempt - 1));
+    const delay = serverDelay || fallbackDelay;
+
+    return Math.max(1000, Math.min(delay, RATE_LIMIT_RETRY_MAX_MS));
+  }
+
+  function formatDelay(ms) {
+    const seconds = Math.ceil(ms / 1000);
+
+    if (seconds < 60) {
+      return `${seconds}s`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+
+    return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+
+  async function sleepWithProgress(ms, requestId, description) {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < ms) {
+      const remaining = ms - (Date.now() - startedAt);
+      const waitMs = Math.min(remaining, RATE_LIMIT_RETRY_HEARTBEAT_MS);
+
+      await sleep(waitMs);
+
+      const nextRemaining = ms - (Date.now() - startedAt);
+      if (nextRemaining > 0) {
+        postProgress(requestId, `Still rate limited while ${description}; retrying in ${formatDelay(nextRemaining)}.`);
+      }
+    }
+  }
+
+  async function withRateLimitRetry(description, requestId, operation) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (!isRateLimitError(error)) {
+          throw error;
+        }
+
+        if (attempt >= RATE_LIMIT_RETRY_MAX_ATTEMPTS) {
+          throw new Error(`Rate limit did not clear after ${RATE_LIMIT_RETRY_MAX_ATTEMPTS} retries while ${description}: ${errorMessage(error)}`);
+        }
+
+        const retryNumber = attempt + 1;
+        const delay = retryDelayMs(error, retryNumber);
+        postProgress(
+          requestId,
+          `Rate limited while ${description}; retrying in ${formatDelay(delay)} (${retryNumber}/${RATE_LIMIT_RETRY_MAX_ATTEMPTS}).`
+        );
+        await sleepWithProgress(delay, requestId, description);
+      }
+    }
+  }
+
   async function resolveRoom(client, roomIdOrAlias) {
     if (!roomIdOrAlias) {
       throw new Error("Missing Matrix room id or alias");
@@ -436,6 +603,25 @@
     content[MATTERMOST_CONTENT_KEY] = {
       version: 1,
       ...meta
+    };
+
+    return content;
+  }
+
+  function addThreadRelation(content, thread) {
+    if (!thread?.rootEventId || content["m.relates_to"]) {
+      return content;
+    }
+
+    const fallbackEventId = thread.fallbackEventId || thread.rootEventId;
+
+    content["m.relates_to"] = {
+      rel_type: "m.thread",
+      event_id: thread.rootEventId,
+      "m.in_reply_to": {
+        event_id: fallbackEventId
+      },
+      is_falling_back: true
     };
 
     return content;
@@ -517,6 +703,14 @@
     }
   }
 
+  function rememberMapValue(map, key, value) {
+    if (!key) return;
+
+    if (!map.has(key) || (!map.get(key) && value)) {
+      map.set(key, value || "");
+    }
+  }
+
   function addEventToDuplicateIndex(index, event) {
     if (!index || !event) return;
 
@@ -537,17 +731,19 @@
         content: importedContentFromBody(body)
       });
 
-      if (signature) index.signatures.add(signature);
+      rememberMapValue(index.signatures, signature, eventId);
     }
 
     const bodySignature = duplicateBodySignature(body);
-    if (bodySignature) index.bodySignatures.add(bodySignature);
+    rememberMapValue(index.bodySignatures, bodySignature, meta.post_id ? eventId : "");
+    rememberMapValue(index.postEventIds, meta.post_id || "", eventId);
   }
 
   function emptyDuplicateIndex() {
     return {
-      signatures: new Set(),
-      bodySignatures: new Set(),
+      signatures: new Map(),
+      bodySignatures: new Map(),
+      postEventIds: new Map(),
       seenEventIds: new Set(),
       scannedHistory: false,
       historyLimited: false
@@ -621,14 +817,14 @@
     return "";
   }
 
-  async function fetchBackwardsMessages(client, roomId, fromToken) {
+  async function fetchBackwardsMessages(client, roomId, fromToken, requestId) {
     const http = client?.http || client?._http;
 
     if (!http || typeof http.authedRequest !== "function" || !fromToken) {
       return null;
     }
 
-    return http.authedRequest(
+    return withRateLimitRetry("scanning Matrix history", requestId, () => http.authedRequest(
       undefined,
       "GET",
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`,
@@ -637,7 +833,7 @@
         from: fromToken,
         limit: DUPLICATE_HISTORY_PAGE_SIZE
       }
-    );
+    ));
   }
 
   async function addServerHistoryToDuplicateIndex(client, room, roomId, index, requestId) {
@@ -657,7 +853,7 @@
       let result = null;
 
       try {
-        result = await fetchBackwardsMessages(client, roomId, token);
+        result = await fetchBackwardsMessages(client, roomId, token, requestId);
       } catch (error) {
         postProgress(requestId, `Could not scan older Matrix history for duplicates: ${error?.message || error}`);
         break;
@@ -716,17 +912,27 @@
     const index = await getDuplicateIndex(client, roomId, requestId);
 
     if (signature && index.signatures.has(signature)) {
-      return { duplicate: true, matchedBy: "author-content-time" };
+      return {
+        duplicate: true,
+        matchedBy: "author-content-time",
+        eventId: index.signatures.get(signature) || "",
+        postId: duplicateCheck?.postId || ""
+      };
     }
 
     if (bodySignature && index.bodySignatures.has(bodySignature)) {
-      return { duplicate: true, matchedBy: "body" };
+      return {
+        duplicate: true,
+        matchedBy: "body",
+        eventId: index.bodySignatures.get(bodySignature) || "",
+        postId: duplicateCheck?.postId || ""
+      };
     }
 
     return { duplicate: false, matchedBy: "" };
   }
 
-  function rememberDuplicateCheck(roomId, duplicateCheck) {
+  function rememberDuplicateCheck(roomId, duplicateCheck, eventId = "") {
     let index = duplicateIndexes.get(roomId);
 
     if (!index) {
@@ -737,8 +943,31 @@
     const signature = duplicateSignature(duplicateCheck);
     const bodySignature = duplicateBodySignature(duplicateCheck?.body);
 
-    if (signature) index.signatures.add(signature);
-    if (bodySignature) index.bodySignatures.add(bodySignature);
+    rememberMapValue(index.signatures, signature, eventId);
+    rememberMapValue(index.bodySignatures, bodySignature, eventId);
+    rememberMapValue(index.postEventIds, duplicateCheck?.postId || "", eventId);
+  }
+
+  async function resolveThreadContext(client, roomId, thread, requestId) {
+    const rootPostId = String(thread?.rootPostId || "").trim();
+
+    if (!rootPostId) {
+      return null;
+    }
+
+    const index = await getDuplicateIndex(client, roomId, requestId);
+    const rootEventId = String(thread?.rootEventId || index.postEventIds.get(rootPostId) || "").trim();
+
+    if (!rootEventId) {
+      postProgress(requestId, `Thread root ${rootPostId} is not available in Matrix history; sending in main timeline.`);
+      return null;
+    }
+
+    return {
+      rootPostId,
+      rootEventId,
+      fallbackEventId: String(thread?.fallbackEventId || rootEventId).trim() || rootEventId
+    };
   }
 
   async function checkDuplicate(payload) {
@@ -759,11 +988,19 @@
       ok: true,
       roomId,
       duplicate: result.duplicate,
-      matchedBy: result.matchedBy
+      matchedBy: result.matchedBy,
+      eventId: result.eventId || "",
+      postId: result.postId || payload.duplicateCheck?.postId || ""
     };
   }
 
-  async function sendTextItem(client, roomId, item, requestId) {
+  function eventIdFromSendResult(result) {
+    if (typeof result === "string") return result;
+
+    return result?.event_id || result?.eventId || result?.event?.event_id || "";
+  }
+
+  async function sendTextItem(client, roomId, item, requestId, threadContext) {
     postProgress(requestId, `Sende Text: ${item.shortLabel || item.meta?.post_id || "Mattermost message"}`);
 
     const content = {
@@ -789,16 +1026,23 @@
       content.formatted_body = `${content.formatted_body || escapeHtml(content.body)}${makeGalleryHtmlMetadata(item.gallery.id, "caption", -1, item.gallery.count)}`;
     }
 
-    await client.sendMessage(roomId, addMattermostMetadata(content, item.meta));
+    const eventContent = addMattermostMetadata(addThreadRelation(content, threadContext), item.meta);
+    const result = await withRateLimitRetry("sending text", requestId, () => client.sendMessage(roomId, eventContent));
+
+    return eventIdFromSendResult(result);
   }
 
-  async function sendFileItem(client, roomId, item, requestId) {
+  async function sendFileItem(client, roomId, item, requestId, threadContext) {
     const file = item.file;
     const meta = item.fileMeta || {};
 
     postProgress(requestId, `Lade Datei hoch: ${meta.name || file?.name || "file"}`);
 
-    const mxcUrl = await uploadContentViaClient(client, file, meta);
+    const mxcUrl = await withRateLimitRetry(
+      `uploading ${meta.name || file?.name || "file"}`,
+      requestId,
+      () => uploadContentViaClient(client, file, meta)
+    );
     const isImage = String(meta.type || file?.type || "").startsWith("image/");
 
     const content = {
@@ -826,7 +1070,10 @@
     }
 
     postProgress(requestId, `Sende Datei: ${content.body}`);
-    await client.sendMessage(roomId, addMattermostMetadata(content, item.meta));
+    const eventContent = addMattermostMetadata(addThreadRelation(content, threadContext), item.meta);
+    const result = await withRateLimitRetry(`sending file ${content.body}`, requestId, () => client.sendMessage(roomId, eventContent));
+
+    return eventIdFromSendResult(result);
   }
 
   async function sendItems(payload) {
@@ -852,33 +1099,44 @@
           roomId,
           sent: 0,
           duplicate: true,
-          matchedBy: duplicateResult.matchedBy
+          matchedBy: duplicateResult.matchedBy,
+          primaryEventId: duplicateResult.eventId || "",
+          eventIds: duplicateResult.eventId ? [duplicateResult.eventId] : []
         };
       }
     }
 
+    const threadContext = await resolveThreadContext(client, roomId, payload.thread, requestId);
+    const eventIds = [];
+
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
+      let eventId = "";
       postProgress(requestId, `Sende Importelement ${i + 1}/${items.length} ...`);
 
       if (item.kind === "text") {
-        await sendTextItem(client, roomId, item, requestId);
+        eventId = await sendTextItem(client, roomId, item, requestId, threadContext);
       } else if (item.kind === "file") {
-        await sendFileItem(client, roomId, item, requestId);
+        eventId = await sendFileItem(client, roomId, item, requestId, threadContext);
       } else {
         throw new Error(`Unknown import item kind: ${item.kind}`);
       }
+
+      if (eventId) eventIds.push(eventId);
     }
 
     if (duplicateCheck) {
-      rememberDuplicateCheck(roomId, duplicateCheck);
+      rememberDuplicateCheck(roomId, duplicateCheck, eventIds[0] || "");
     }
 
     return {
       ok: true,
       roomId,
       sent: items.length,
-      duplicate: false
+      duplicate: false,
+      primaryEventId: eventIds[0] || "",
+      eventIds,
+      threadRootEventId: threadContext?.rootEventId || ""
     };
   }
 

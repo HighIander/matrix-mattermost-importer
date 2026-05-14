@@ -22,6 +22,8 @@
   const PAGE_BRIDGE_SEND_PROGRESS = "matrix-mattermost-importer-send-progress";
   const PAGE_BRIDGE_DUPLICATE_REQUEST = "matrix-mattermost-importer-duplicate-request";
   const PAGE_BRIDGE_DUPLICATE_RESPONSE = "matrix-mattermost-importer-duplicate-response";
+  const PAGE_BRIDGE_DEFAULT_TIMEOUT_MS = 180000;
+  const PAGE_BRIDGE_SEND_TIMEOUT_MS = 600000;
   const MAIN_BUTTON_ICON = `
     <svg class="mmi-button-icon" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
       <path d="M16 13H25L34 30L43 13H52V39H43V28L36 39H32L25 28V39H16Z" fill="currentColor"/>
@@ -377,12 +379,106 @@
     });
   }
 
+  function restoreGeneratedTokens(value, htmlTokens, linkTokens) {
+    return String(value || "")
+      .replace(/__MMI_LINK_(\d+)__/g, (match, index) => linkTokens[Number(index)] || match)
+      .replace(/__MMI_HTML_TOKEN_(\d+)__/g, (match, index) => htmlTokens[Number(index)] || match);
+  }
+
+  function renderInlineMattermostMarkdown(value, htmlTokens, linkTokens) {
+    let html = escapeHtml(value);
+
+    html = html.replace(
+      /(https?:\/\/[^\s<*~`]+)/g,
+      '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+    );
+
+    html = html
+      .replace(/~~([^~\n]+?)~~/g, "<del>$1</del>")
+      .replace(/\*\*([^*\n]+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^\*])\*([^*\s](?:[^*\n]*?[^*\s])?)\*(?!\*)/g, "$1<em>$2</em>");
+
+    return restoreGeneratedTokens(html, htmlTokens, linkTokens);
+  }
+
+  function renderMattermostMarkdownBlocks(value, htmlTokens, linkTokens) {
+    const lines = String(value || "").split("\n");
+    const output = [];
+    let listType = "";
+    let previousTextLine = false;
+
+    const closeList = () => {
+      if (!listType) return;
+      output.push(`</${listType}>`);
+      listType = "";
+      previousTextLine = false;
+    };
+
+    const openList = type => {
+      if (listType === type) return;
+      closeList();
+      if (previousTextLine) output.push("<br>");
+      output.push(`<${type}>`);
+      listType = type;
+      previousTextLine = false;
+    };
+
+    for (const line of lines) {
+      const fencedCodeToken = line.trim().match(/^__MMI_HTML_TOKEN_\d+__$/);
+      if (fencedCodeToken) {
+        closeList();
+        output.push(renderInlineMattermostMarkdown(line.trim(), htmlTokens, linkTokens));
+        previousTextLine = false;
+        continue;
+      }
+
+      const unorderedItem = line.match(/^[ \t]{0,3}[*+-][ \t]+(.+)$/);
+      if (unorderedItem) {
+        openList("ul");
+        output.push(`<li>${renderInlineMattermostMarkdown(unorderedItem[1], htmlTokens, linkTokens)}</li>`);
+        continue;
+      }
+
+      const orderedItem = line.match(/^[ \t]{0,3}\d+[.)][ \t]+(.+)$/);
+      if (orderedItem) {
+        openList("ol");
+        output.push(`<li>${renderInlineMattermostMarkdown(orderedItem[1], htmlTokens, linkTokens)}</li>`);
+        continue;
+      }
+
+      const quote = line.match(/^[ \t]{0,3}>[ \t]?(.*)$/);
+      if (quote) {
+        closeList();
+        if (previousTextLine) output.push("<br>");
+        output.push(`<blockquote>${renderInlineMattermostMarkdown(quote[1], htmlTokens, linkTokens)}</blockquote>`);
+        previousTextLine = false;
+        continue;
+      }
+
+      closeList();
+
+      if (line === "") {
+        output.push("<br>");
+        previousTextLine = false;
+        continue;
+      }
+
+      if (previousTextLine) output.push("<br>");
+      output.push(renderInlineMattermostMarkdown(line, htmlTokens, linkTokens));
+      previousTextLine = true;
+    }
+
+    closeList();
+    return output.join("");
+  }
+
   function htmlFromPlainText(value) {
     /*
      * Preserve the most common Mattermost link forms when importing into
      * Matrix HTML: code blocks/spans, Markdown links, autolinks, bare URLs,
-     * line breaks, and common emoji shortcodes. HTML from Mattermost messages
-     * is never trusted; all non-generated content is escaped.
+     * bullet/numbered lists, blockquotes, emphasis, and common emoji
+     * shortcodes. HTML from Mattermost messages is never trusted; all
+     * non-generated content is escaped.
      */
     let text = convertCommonEmojiShortcodes(String(value || "").replace(/\r\n/g, "\n"));
     const htmlTokens = [];
@@ -403,18 +499,7 @@
       return token;
     });
 
-    let escaped = escapeHtml(text);
-
-    escaped = escaped.replace(
-      /(https?:\/\/[^\s<]+)/g,
-      '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
-    );
-
-    escaped = escaped.replace(/__MMI_LINK_(\d+)__/g, (match, index) => linkTokens[Number(index)] || match);
-
-    escaped = escaped.replace(/\n/g, "<br>");
-
-    return escaped.replace(/__MMI_HTML_TOKEN_(\d+)__/g, (match, index) => htmlTokens[Number(index)] || match);
+    return renderMattermostMarkdownBlocks(text, htmlTokens, linkTokens);
   }
 
   function normalizePath(value) {
@@ -1442,6 +1527,50 @@
     };
   }
 
+  function threadRootPostId(post) {
+    const rootId = String(post.root_id || "").trim();
+    const postId = String(post.id || "").trim();
+
+    return rootId && rootId !== postId ? rootId : "";
+  }
+
+  function makeThreadContextForPost(post, postEventIds, threadLatestEventIds) {
+    const rootPostId = threadRootPostId(post);
+
+    if (!rootPostId) {
+      return null;
+    }
+
+    const rootEventId = postEventIds.get(rootPostId) || "";
+
+    return {
+      rootPostId,
+      rootEventId,
+      fallbackEventId: threadLatestEventIds.get(rootPostId) || rootEventId || ""
+    };
+  }
+
+  function primaryEventIdFromSendResult(result) {
+    return result?.primaryEventId || (Array.isArray(result?.eventIds) ? result.eventIds[0] : "") || result?.eventId || "";
+  }
+
+  function rememberPostEventId(post, eventId, postEventIds, threadLatestEventIds) {
+    if (!eventId || !post?.id) {
+      return;
+    }
+
+    const postId = String(post.id);
+    const rootPostId = threadRootPostId(post);
+
+    postEventIds.set(postId, eventId);
+
+    if (rootPostId) {
+      threadLatestEventIds.set(rootPostId, eventId);
+    } else {
+      threadLatestEventIds.set(postId, eventId);
+    }
+  }
+
   async function buildItemsForPost(channel, post, includeOtherFiles) {
     const items = [];
     const images = imageFileInfos(post);
@@ -1501,26 +1630,44 @@
     return items;
   }
 
-  function pageBridgeRequest({ type, responseType, requestIdPrefix, room, items = [], duplicateCheck = null, timeoutMs = 180000 }, log) {
+  function pageBridgeRequest({ type, responseType, requestIdPrefix, room, items = [], duplicateCheck = null, thread = null, timeoutMs = PAGE_BRIDGE_DEFAULT_TIMEOUT_MS }, log) {
     const requestId = `${requestIdPrefix}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      let timeout = null;
+      let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        window.removeEventListener("message", onMessage);
+      };
+
+      const failTimeout = () => {
+        if (settled) return;
+        settled = true;
         cleanup();
         reject(new Error("Live Element MatrixClient request timed out"));
-      }, timeoutMs);
+      };
+
+      const armTimeout = () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(failTimeout, timeoutMs);
+      };
 
       const onMessage = event => {
         if (event.source !== window) return;
         if (!event.data || event.data.source !== PAGE_BRIDGE_SOURCE) return;
         if (event.data.requestId !== requestId) return;
+        if (settled) return;
 
         if (event.data.type === PAGE_BRIDGE_SEND_PROGRESS) {
+          armTimeout();
           log(event.data.message || "Sending ...");
           return;
         }
 
         if (event.data.type === responseType) {
+          settled = true;
           cleanup();
 
           if (event.data.ok) {
@@ -1531,19 +1678,16 @@
         }
       };
 
-      const cleanup = () => {
-        clearTimeout(timeout);
-        window.removeEventListener("message", onMessage);
-      };
-
       window.addEventListener("message", onMessage);
+      armTimeout();
 
       window.postMessage({
         type,
         requestId,
         room,
         items,
-        duplicateCheck
+        duplicateCheck,
+        thread
       }, window.location.origin);
     });
   }
@@ -1559,14 +1703,16 @@
     }, log);
   }
 
-  function sendItemsViaPageBridge(room, items, log, duplicateCheck = null) {
+  function sendItemsViaPageBridge(room, items, log, duplicateCheck = null, thread = null) {
     return pageBridgeRequest({
       type: PAGE_BRIDGE_SEND_REQUEST,
       responseType: PAGE_BRIDGE_SEND_RESPONSE,
       requestIdPrefix: "mmi_send",
       room,
       items,
-      duplicateCheck
+      duplicateCheck,
+      thread,
+      timeoutMs: PAGE_BRIDGE_SEND_TIMEOUT_MS
     }, log);
   }
 
@@ -1804,6 +1950,8 @@
       let skippedImages = 0;
       let skippedFiles = 0;
       let cancelled = false;
+      const postEventIds = new Map();
+      const threadLatestEventIds = new Map();
 
       updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Importing...");
 
@@ -1820,6 +1968,8 @@
         const duplicateResult = await checkDuplicateViaPageBridge(room, duplicateCheck, text => appendLog(root, text));
 
         if (duplicateResult.duplicate) {
+          rememberPostEventId(post, duplicateResult.eventId || "", postEventIds, threadLatestEventIds);
+
           processedPosts += 1;
           processedImages += postImages;
           skippedPosts += 1;
@@ -1847,6 +1997,7 @@
         }
 
         const items = await buildItemsForPost(channel, post, includeOtherFiles);
+        const threadContext = makeThreadContextForPost(post, postEventIds, threadLatestEventIds);
 
         if (state.cancelRequested) {
           cancelled = true;
@@ -1861,7 +2012,17 @@
           continue;
         }
 
-        const sendResult = await sendItemsViaPageBridge(room, items, text => appendLog(root, text), duplicateCheck);
+        const sendResult = await sendItemsViaPageBridge(room, items, text => appendLog(root, text), duplicateCheck, threadContext);
+        const primaryEventId = primaryEventIdFromSendResult(sendResult);
+
+        if (threadContext?.rootPostId && sendResult.threadRootEventId) {
+          postEventIds.set(threadContext.rootPostId, sendResult.threadRootEventId);
+          if (!threadLatestEventIds.has(threadContext.rootPostId)) {
+            threadLatestEventIds.set(threadContext.rootPostId, sendResult.threadRootEventId);
+          }
+        }
+
+        rememberPostEventId(post, primaryEventId, postEventIds, threadLatestEventIds);
 
         processedPosts += 1;
         processedImages += postImages;
