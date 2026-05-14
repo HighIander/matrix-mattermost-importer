@@ -11,7 +11,6 @@
   const DUPLICATE_RESPONSE = "matrix-mattermost-importer-duplicate-response";
   const GALLERY_CONTENT_KEY = "de.tkluge.gallery";
   const MATTERMOST_CONTENT_KEY = "de.tkluge.mattermost_import";
-  const DUPLICATE_HISTORY_LIMIT = 10000;
   const DUPLICATE_HISTORY_PAGE_SIZE = 100;
   const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 12;
   const RATE_LIMIT_RETRY_DEFAULT_MS = 5000;
@@ -844,12 +843,13 @@
 
     if (!token) {
       index.scannedHistory = true;
+      index.historyLimited = false;
       return;
     }
 
-    postProgress(requestId, "Indexing existing Matrix messages for duplicate checks...");
+    postProgress(requestId, "Indexing all available existing Matrix messages for duplicate checks...");
 
-    while (token && scanned < DUPLICATE_HISTORY_LIMIT) {
+    while (token) {
       let result = null;
 
       try {
@@ -864,7 +864,6 @@
       for (const event of chunk) {
         addEventToDuplicateIndex(index, event);
         scanned += 1;
-        if (scanned >= DUPLICATE_HISTORY_LIMIT) break;
       }
 
       if (!result?.end || result.end === token || chunk.length === 0) break;
@@ -876,10 +875,10 @@
     }
 
     index.scannedHistory = true;
-    index.historyLimited = Boolean(token && scanned >= DUPLICATE_HISTORY_LIMIT);
+    index.historyLimited = false;
 
-    if (index.historyLimited) {
-      postProgress(requestId, `Duplicate history scan stopped after ${DUPLICATE_HISTORY_LIMIT} older events.`);
+    if (scanned > 0) {
+      postProgress(requestId, `Finished duplicate history scan after indexing ${scanned} older Matrix events.`);
     }
   }
 

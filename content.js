@@ -1869,6 +1869,74 @@
     if (importFrom) importFrom.disabled = importing;
   }
 
+  function confirmImportAfterScrollWarning(root, details) {
+    /*
+     * Duplicate detection is only as complete as the Matrix history that Element
+     * has loaded or can paginate from the current timeline. Showing a blocking
+     * in-extension warning avoids starting the upload accidentally before the
+     * user has scrolled to the beginning of the Matrix room.
+     */
+    return new Promise(resolve => {
+      const previous = root.querySelector(".mmi-import-warning-backdrop");
+      if (previous) previous.remove();
+
+      const backdrop = document.createElement("div");
+      backdrop.className = "mmi-import-warning-backdrop";
+      backdrop.setAttribute("role", "dialog");
+      backdrop.setAttribute("aria-modal", "true");
+      backdrop.setAttribute("aria-labelledby", "mmi-import-warning-title");
+
+      const dateFilterRow = details.dateFilterText
+        ? `<li>${escapeHtml(details.dateFilterText.trim())}</li>`
+        : "";
+
+      backdrop.innerHTML = `
+        <div class="mmi-import-warning-dialog">
+          <h3 id="mmi-import-warning-title">Scroll to the beginning before importing</h3>
+          <p>
+            The duplicate check compares the Mattermost export against the Matrix messages that are available in this Element room.
+            For the check to be complete, scroll up to the beginning of the Matrix chat before starting the import.
+          </p>
+          <p>
+            If you proceed without doing that, older duplicates may not be detected and can be imported again.
+            The importer no longer applies an artificial limit to the number of older Matrix messages it checks.
+          </p>
+          <div class="mmi-import-warning-summary">
+            <strong>Pending import</strong>
+            <ul>
+              <li>Source: ${escapeHtml(details.channelTitle)}</li>
+              <li>Messages: ${escapeHtml(details.messageCount)}</li>
+              <li>Images: ${escapeHtml(details.imageCount)}</li>
+              <li>Other exported files: ${escapeHtml(details.otherFileCount)}</li>
+              <li>Missing exported files in selected folder: ${escapeHtml(details.missingFileCount)}</li>
+              ${dateFilterRow}
+            </ul>
+          </div>
+          <div class="mmi-import-warning-actions">
+            <button class="mmi-cancel-button" id="mmi-import-warning-cancel" type="button">Cancel</button>
+            <button class="mmi-primary-button" id="mmi-import-warning-proceed" type="button">Ignore and proceed with import</button>
+          </div>
+        </div>
+      `;
+
+      const finish = value => {
+        backdrop.remove();
+        resolve(value);
+      };
+
+      root.appendChild(backdrop);
+      qs("#mmi-import-warning-cancel", backdrop).addEventListener("click", () => finish(false));
+      qs("#mmi-import-warning-proceed", backdrop).addEventListener("click", () => finish(true));
+      backdrop.addEventListener("click", event => {
+        if (event.target === backdrop) finish(false);
+      });
+      backdrop.addEventListener("keydown", event => {
+        if (event.key === "Escape") finish(false);
+      });
+      qs("#mmi-import-warning-proceed", backdrop).focus();
+    });
+  }
+
   async function importSelectedChannel(root) {
     if (state.importing) return;
     if (!state.selectedChannel) throw new Error("No Mattermost channel selected.");
@@ -1895,19 +1963,19 @@
       const posts = filterInfo.posts;
       const stats = await countImportStats(posts);
       const dateFilterText = filterInfo.active
-        ? `Import from: ${filterInfo.label} (${filterInfo.ignoredCount} earlier messages ignored)\n`
+        ? `Import from: ${filterInfo.label} (${filterInfo.ignoredCount} earlier messages ignored)`
         : "";
 
-      updateImportProgress(root, 0, stats.messages, 0, stats.images, "Ready to import.");
+      updateImportProgress(root, 0, stats.messages, 0, stats.images, "Waiting for duplicate-check warning confirmation...");
 
-      const confirmed = window.confirm(
-        `Really import ${stats.messages} messages and ${stats.images} images into the current Matrix room?\n\n` +
-        `Source: ${channelTitle(channel)}\n` +
-        dateFilterText +
-        `Duplicate check: author, content and Mattermost timestamp\n` +
-        `Other exported files: ${includeOtherFiles ? stats.otherFiles : 0}\n` +
-        `Missing exported files in selected folder: ${stats.missingFiles}`
-      );
+      const confirmed = await confirmImportAfterScrollWarning(root, {
+        channelTitle: channelTitle(channel),
+        messageCount: stats.messages,
+        imageCount: stats.images,
+        otherFileCount: includeOtherFiles ? stats.otherFiles : 0,
+        missingFileCount: stats.missingFiles,
+        dateFilterText
+      });
 
       if (!confirmed) {
         appendLog(root, "Import cancelled before sending.");
@@ -1915,6 +1983,7 @@
         return;
       }
 
+      appendLog(root, "Duplicate-check warning ignored by user. Continuing import.");
       updateImportProgress(root, 0, stats.messages, 0, stats.images, "Importing...");
       appendLog(root, `Importing ${stats.messages} messages, ${stats.images} images into ${room}`);
       if (filterInfo.active) {
