@@ -7,10 +7,16 @@
   const SEND_REQUEST = "matrix-mattermost-importer-send-request";
   const SEND_RESPONSE = "matrix-mattermost-importer-send-response";
   const SEND_PROGRESS = "matrix-mattermost-importer-send-progress";
+  const DUPLICATE_REQUEST = "matrix-mattermost-importer-duplicate-request";
+  const DUPLICATE_RESPONSE = "matrix-mattermost-importer-duplicate-response";
   const GALLERY_CONTENT_KEY = "de.tkluge.gallery";
+  const MATTERMOST_CONTENT_KEY = "de.tkluge.mattermost_import";
+  const DUPLICATE_HISTORY_LIMIT = 10000;
+  const DUPLICATE_HISTORY_PAGE_SIZE = 100;
 
   let lastSession = null;
   let installed = false;
+  const duplicateIndexes = new Map();
 
   function cleanUrl(value) {
     if (typeof value !== "string") return "";
@@ -427,12 +433,334 @@
   function addMattermostMetadata(content, meta) {
     if (!meta || typeof meta !== "object") return content;
 
-    content["de.tkluge.mattermost_import"] = {
+    content[MATTERMOST_CONTENT_KEY] = {
       version: 1,
       ...meta
     };
 
     return content;
+  }
+
+  function normalizeDuplicateText(value) {
+    return String(value || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .split("\n")
+      .map(line => line.replace(/[ \t]+/g, " ").trim())
+      .join("\n")
+      .trim();
+  }
+
+  function normalizeDuplicateAuthor(value) {
+    return String(value || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function normalizeDuplicateTime(value) {
+    const numberValue = Number(value);
+
+    if (Number.isFinite(numberValue)) {
+      return String(Math.trunc(numberValue));
+    }
+
+    return String(value || "").trim();
+  }
+
+  function importedContentFromBody(body) {
+    const value = normalizeDuplicateText(body);
+    const splitAt = value.indexOf("\n");
+
+    return splitAt === -1 ? value : value.slice(splitAt + 1).trim();
+  }
+
+  function duplicateSignature(check) {
+    if (!check || typeof check !== "object") return "";
+
+    const senderName = normalizeDuplicateAuthor(check.senderName || check.sender_name);
+    const createAt = normalizeDuplicateTime(check.createAt ?? check.create_at);
+    const content = normalizeDuplicateText(check.content);
+
+    if (!senderName || !createAt) return "";
+
+    return `${senderName}\u001f${createAt}\u001f${content}`;
+  }
+
+  function duplicateBodySignature(body) {
+    const value = normalizeDuplicateText(body);
+
+    return value ? `body\u001f${value}` : "";
+  }
+
+  function getEventId(event) {
+    try {
+      return event?.getId?.() || event?.event?.event_id || event?.event_id || "";
+    } catch {
+      return event?.event?.event_id || event?.event_id || "";
+    }
+  }
+
+  function getEventType(event) {
+    try {
+      return event?.getType?.() || event?.event?.type || event?.type || "";
+    } catch {
+      return event?.event?.type || event?.type || "";
+    }
+  }
+
+  function getEventContent(event) {
+    try {
+      return event?.getContent?.() || event?.event?.content || event?.content || {};
+    } catch {
+      return event?.event?.content || event?.content || {};
+    }
+  }
+
+  function addEventToDuplicateIndex(index, event) {
+    if (!index || !event) return;
+
+    const eventId = getEventId(event);
+    if (eventId && index.seenEventIds.has(eventId)) return;
+    if (eventId) index.seenEventIds.add(eventId);
+
+    if (getEventType(event) !== "m.room.message") return;
+
+    const content = getEventContent(event);
+    const body = content?.body || "";
+    const meta = content?.[MATTERMOST_CONTENT_KEY] || {};
+
+    if (meta.sender_name && meta.create_at !== undefined) {
+      const signature = duplicateSignature({
+        senderName: meta.sender_name,
+        createAt: meta.create_at,
+        content: importedContentFromBody(body)
+      });
+
+      if (signature) index.signatures.add(signature);
+    }
+
+    const bodySignature = duplicateBodySignature(body);
+    if (bodySignature) index.bodySignatures.add(bodySignature);
+  }
+
+  function emptyDuplicateIndex() {
+    return {
+      signatures: new Set(),
+      bodySignatures: new Set(),
+      seenEventIds: new Set(),
+      scannedHistory: false,
+      historyLimited: false
+    };
+  }
+
+  function addTimelineEvents(events, output, seen) {
+    for (const event of events || []) {
+      const eventId = getEventId(event);
+      const key = eventId || event;
+
+      if (seen.has(key)) continue;
+      seen.add(key);
+      output.push(event);
+    }
+  }
+
+  function loadedRoomEvents(room) {
+    const events = [];
+    const seen = new Set();
+
+    try {
+      addTimelineEvents(room?.timeline || [], events, seen);
+    } catch {}
+
+    try {
+      addTimelineEvents(room?.getLiveTimeline?.()?.getEvents?.() || [], events, seen);
+    } catch {}
+
+    try {
+      addTimelineEvents(room?.getUnfilteredTimelineSet?.()?.getLiveTimeline?.()?.getEvents?.() || [], events, seen);
+    } catch {}
+
+    try {
+      for (const timelineSet of room?.getTimelineSets?.() || []) {
+        addTimelineEvents(timelineSet?.getLiveTimeline?.()?.getEvents?.() || [], events, seen);
+        for (const timeline of timelineSet?.getTimelines?.() || []) {
+          addTimelineEvents(timeline?.getEvents?.() || [], events, seen);
+        }
+      }
+    } catch {}
+
+    return events;
+  }
+
+  function getBackwardPaginationToken(room) {
+    const timelines = [];
+
+    try {
+      const liveTimeline = room?.getLiveTimeline?.();
+      if (liveTimeline) timelines.push(liveTimeline);
+    } catch {}
+
+    try {
+      const unfilteredTimeline = room?.getUnfilteredTimelineSet?.()?.getLiveTimeline?.();
+      if (unfilteredTimeline) timelines.push(unfilteredTimeline);
+    } catch {}
+
+    for (const timeline of timelines) {
+      try {
+        const token =
+          timeline.getPaginationToken?.("b") ||
+          timeline.getPaginationToken?.("backwards") ||
+          timeline.paginationToken?.b ||
+          timeline.paginationToken;
+
+        if (token) return token;
+      } catch {}
+    }
+
+    return "";
+  }
+
+  async function fetchBackwardsMessages(client, roomId, fromToken) {
+    const http = client?.http || client?._http;
+
+    if (!http || typeof http.authedRequest !== "function" || !fromToken) {
+      return null;
+    }
+
+    return http.authedRequest(
+      undefined,
+      "GET",
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`,
+      {
+        dir: "b",
+        from: fromToken,
+        limit: DUPLICATE_HISTORY_PAGE_SIZE
+      }
+    );
+  }
+
+  async function addServerHistoryToDuplicateIndex(client, room, roomId, index, requestId) {
+    if (!room || index.scannedHistory) return;
+
+    let token = getBackwardPaginationToken(room);
+    let scanned = 0;
+
+    if (!token) {
+      index.scannedHistory = true;
+      return;
+    }
+
+    postProgress(requestId, "Indexing existing Matrix messages for duplicate checks...");
+
+    while (token && scanned < DUPLICATE_HISTORY_LIMIT) {
+      let result = null;
+
+      try {
+        result = await fetchBackwardsMessages(client, roomId, token);
+      } catch (error) {
+        postProgress(requestId, `Could not scan older Matrix history for duplicates: ${error?.message || error}`);
+        break;
+      }
+
+      const chunk = Array.isArray(result?.chunk) ? result.chunk : [];
+
+      for (const event of chunk) {
+        addEventToDuplicateIndex(index, event);
+        scanned += 1;
+        if (scanned >= DUPLICATE_HISTORY_LIMIT) break;
+      }
+
+      if (!result?.end || result.end === token || chunk.length === 0) break;
+      token = result.end;
+
+      if (scanned > 0 && scanned % 1000 === 0) {
+        postProgress(requestId, `Indexed ${scanned} older Matrix events for duplicate checks...`);
+      }
+    }
+
+    index.scannedHistory = true;
+    index.historyLimited = Boolean(token && scanned >= DUPLICATE_HISTORY_LIMIT);
+
+    if (index.historyLimited) {
+      postProgress(requestId, `Duplicate history scan stopped after ${DUPLICATE_HISTORY_LIMIT} older events.`);
+    }
+  }
+
+  async function getDuplicateIndex(client, roomId, requestId) {
+    const room = getRoomByIdOrAlias(client, roomId);
+    let index = duplicateIndexes.get(roomId);
+
+    if (!index) {
+      index = emptyDuplicateIndex();
+      duplicateIndexes.set(roomId, index);
+    }
+
+    for (const event of loadedRoomEvents(room)) {
+      addEventToDuplicateIndex(index, event);
+    }
+
+    await addServerHistoryToDuplicateIndex(client, room, roomId, index, requestId);
+
+    return index;
+  }
+
+  async function checkDuplicateImport(client, roomId, duplicateCheck, requestId) {
+    const signature = duplicateSignature(duplicateCheck);
+    const bodySignature = duplicateBodySignature(duplicateCheck?.body);
+
+    if (!signature && !bodySignature) {
+      return { duplicate: false, matchedBy: "" };
+    }
+
+    const index = await getDuplicateIndex(client, roomId, requestId);
+
+    if (signature && index.signatures.has(signature)) {
+      return { duplicate: true, matchedBy: "author-content-time" };
+    }
+
+    if (bodySignature && index.bodySignatures.has(bodySignature)) {
+      return { duplicate: true, matchedBy: "body" };
+    }
+
+    return { duplicate: false, matchedBy: "" };
+  }
+
+  function rememberDuplicateCheck(roomId, duplicateCheck) {
+    let index = duplicateIndexes.get(roomId);
+
+    if (!index) {
+      index = emptyDuplicateIndex();
+      duplicateIndexes.set(roomId, index);
+    }
+
+    const signature = duplicateSignature(duplicateCheck);
+    const bodySignature = duplicateBodySignature(duplicateCheck?.body);
+
+    if (signature) index.signatures.add(signature);
+    if (bodySignature) index.bodySignatures.add(bodySignature);
+  }
+
+  async function checkDuplicate(payload) {
+    const client = findClient();
+
+    if (!client) {
+      throw new Error("No live MatrixClient found in Element page context");
+    }
+
+    const roomId = await resolveRoom(client, payload.room);
+    const result = await checkDuplicateImport(client, roomId, payload.duplicateCheck, payload.requestId);
+
+    if (result.duplicate) {
+      postProgress(payload.requestId, `Duplicate found for Mattermost post ${payload.duplicateCheck?.postId || ""}`.trim());
+    }
+
+    return {
+      ok: true,
+      roomId,
+      duplicate: result.duplicate,
+      matchedBy: result.matchedBy
+    };
   }
 
   async function sendTextItem(client, roomId, item, requestId) {
@@ -511,6 +839,23 @@
     const roomId = await resolveRoom(client, payload.room);
     const requestId = payload.requestId;
     const items = Array.isArray(payload.items) ? payload.items : [];
+    const duplicateCheck = payload.duplicateCheck || null;
+
+    if (duplicateCheck) {
+      const duplicateResult = await checkDuplicateImport(client, roomId, duplicateCheck, requestId);
+
+      if (duplicateResult.duplicate) {
+        postProgress(requestId, `Skipping duplicate Mattermost post ${duplicateCheck.postId || ""}`.trim());
+
+        return {
+          ok: true,
+          roomId,
+          sent: 0,
+          duplicate: true,
+          matchedBy: duplicateResult.matchedBy
+        };
+      }
+    }
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
@@ -525,10 +870,15 @@
       }
     }
 
+    if (duplicateCheck) {
+      rememberDuplicateCheck(roomId, duplicateCheck);
+    }
+
     return {
       ok: true,
       roomId,
-      sent: items.length
+      sent: items.length,
+      duplicate: false
     };
   }
 
@@ -562,6 +912,30 @@
             window.postMessage({
               source: SOURCE,
               type: SEND_RESPONSE,
+              requestId,
+              ok: false,
+              error: error?.message || String(error)
+            }, window.location.origin);
+          });
+      }
+
+      if (event.data.type === DUPLICATE_REQUEST) {
+        const requestId = event.data.requestId;
+
+        checkDuplicate(event.data)
+          .then(result => {
+            window.postMessage({
+              source: SOURCE,
+              type: DUPLICATE_RESPONSE,
+              requestId,
+              ok: true,
+              result
+            }, window.location.origin);
+          })
+          .catch(error => {
+            window.postMessage({
+              source: SOURCE,
+              type: DUPLICATE_RESPONSE,
               requestId,
               ok: false,
               error: error?.message || String(error)

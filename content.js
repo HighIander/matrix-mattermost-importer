@@ -13,17 +13,30 @@
   const IDB_EXPORT_ROOT_KEY = "exportRoot";
   const BUTTON_ID = "mmi-button";
   const OVERLAY_ID = "mmi-overlay";
+  const MINI_PROGRESS_ID = "mmi-mini-progress";
   const PAGE_BRIDGE_SOURCE = "matrix-mattermost-importer-page-bridge";
   const PAGE_BRIDGE_SESSION_REQUEST = "matrix-mattermost-importer-session-request";
   const PAGE_BRIDGE_SESSION_RESPONSE = "matrix-mattermost-importer-session-response";
   const PAGE_BRIDGE_SEND_REQUEST = "matrix-mattermost-importer-send-request";
   const PAGE_BRIDGE_SEND_RESPONSE = "matrix-mattermost-importer-send-response";
   const PAGE_BRIDGE_SEND_PROGRESS = "matrix-mattermost-importer-send-progress";
+  const PAGE_BRIDGE_DUPLICATE_REQUEST = "matrix-mattermost-importer-duplicate-request";
+  const PAGE_BRIDGE_DUPLICATE_RESPONSE = "matrix-mattermost-importer-duplicate-response";
+  const MAIN_BUTTON_ICON = `
+    <svg class="mmi-button-icon" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+      <path d="M16 13H25L34 30L43 13H52V39H43V28L36 39H32L25 28V39H16Z" fill="currentColor"/>
+      <path d="M58 13H67L76 30L85 13H94V39H85V28L78 39H74L67 28V39H58Z" fill="currentColor"/>
+      <path d="M50 25V67" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="square"/>
+      <path d="M37 64L50 77L63 64Z" fill="currentColor"/>
+      <path d="M13 48H38M62 48H87M13 48V88H87V48" fill="none" stroke="currentColor" stroke-width="7" stroke-linecap="square" stroke-linejoin="miter"/>
+    </svg>
+  `;
 
   const DEFAULT_CONFIG = {
     buttonRight: 18,
-    buttonBottom: 76,
+    buttonBottom: 148,
     includeOtherFiles: true,
+    importFromDate: "",
     rememberExportFolder: true,
     lastExportFolderName: "",
     lastSelectedScopeType: "",
@@ -50,6 +63,15 @@
     loaded: false,
     importing: false,
     cancelRequested: false,
+    importProgress: {
+      currentPosts: 0,
+      totalPosts: 0,
+      currentImages: 0,
+      totalImages: 0,
+      percent: 0,
+      label: "0% - 0/0 messages - 0/0 images",
+      text: "Ready."
+    },
     pendingContextSuggestion: false,
     manualSelectionAfterOpen: false,
     lastSuggestion: null
@@ -113,6 +135,8 @@
   async function loadConfig() {
     const result = await chromeStorageGet({ [STORAGE_KEY]: DEFAULT_CONFIG });
     state.config = { ...DEFAULT_CONFIG, ...(result[STORAGE_KEY] || {}) };
+    state.config.importFromDate = normalizeImportFromDateValue(state.config.importFromDate);
+    state.config.rememberExportFolder = true;
   }
 
   async function saveConfig() {
@@ -224,17 +248,30 @@
   }
 
   async function rememberExportFolderHandle(handle) {
-    if (!state.config.rememberExportFolder || !handle) {
+    if (!handle) {
       return;
     }
 
     try {
       await idbSet(IDB_EXPORT_ROOT_KEY, handle);
+      state.config.rememberExportFolder = true;
       state.config.lastExportFolderName = handle.name || "Mattermost export";
       await saveConfig();
     } catch (error) {
       console.warn("Could not store export folder handle.", error);
     }
+  }
+
+  function exportFolderHintText() {
+    if (state.rootName) {
+      return `Current export folder: ${state.rootName}`;
+    }
+
+    if (state.config.lastExportFolderName) {
+      return `Last export folder: ${state.config.lastExportFolderName}`;
+    }
+
+    return "No export folder remembered yet.";
   }
 
   async function loadRememberedExportFolderHandle() {
@@ -289,15 +326,70 @@
     return String(value || "").replace(/:[+\-a-zA-Z0-9_]+:/g, token => map[token] || token);
   }
 
+  function htmlToken(tokens, html) {
+    const token = `__MMI_HTML_TOKEN_${tokens.length}__`;
+    tokens.push(html);
+    return token;
+  }
+
+  function protectFencedCodeBlocks(text, htmlTokens) {
+    const lines = String(text || "").split("\n");
+    const output = [];
+
+    for (let index = 0; index < lines.length; index++) {
+      const opener = lines[index].match(/^[ \t]{0,3}(`{3,})([^`]*)$/);
+
+      if (!opener) {
+        output.push(lines[index]);
+        continue;
+      }
+
+      const fenceLength = opener[1].length;
+      const codeLines = [];
+      let closeIndex = -1;
+
+      for (let cursor = index + 1; cursor < lines.length; cursor++) {
+        const closer = lines[cursor].match(/^[ \t]{0,3}(`{3,})[ \t]*$/);
+
+        if (closer && closer[1].length >= fenceLength) {
+          closeIndex = cursor;
+          break;
+        }
+
+        codeLines.push(lines[cursor]);
+      }
+
+      if (closeIndex === -1) {
+        output.push(lines[index]);
+        continue;
+      }
+
+      output.push(htmlToken(htmlTokens, `<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`));
+      index = closeIndex;
+    }
+
+    return output.join("\n");
+  }
+
+  function protectInlineCodeSpans(text, htmlTokens) {
+    return String(text || "").replace(/(`+)([^`\n]+?)\1/g, (match, fence, code) => {
+      return htmlToken(htmlTokens, `<code>${escapeHtml(code)}</code>`);
+    });
+  }
+
   function htmlFromPlainText(value) {
     /*
      * Preserve the most common Mattermost link forms when importing into
-     * Matrix HTML: Markdown links, autolinks, bare URLs, line breaks, and
-     * common emoji shortcodes. HTML from Mattermost messages is never trusted;
-     * all non-generated content is escaped.
+     * Matrix HTML: code blocks/spans, Markdown links, autolinks, bare URLs,
+     * line breaks, and common emoji shortcodes. HTML from Mattermost messages
+     * is never trusted; all non-generated content is escaped.
      */
     let text = convertCommonEmojiShortcodes(String(value || "").replace(/\r\n/g, "\n"));
+    const htmlTokens = [];
     const linkTokens = [];
+
+    text = protectFencedCodeBlocks(text, htmlTokens);
+    text = protectInlineCodeSpans(text, htmlTokens);
 
     text = text.replace(/\[([^\]\n]{1,300})\]\((https?:\/\/[^\s)]+)\)/g, (match, label, url) => {
       const token = `__MMI_LINK_${linkTokens.length}__`;
@@ -320,7 +412,9 @@
 
     escaped = escaped.replace(/__MMI_LINK_(\d+)__/g, (match, index) => linkTokens[Number(index)] || match);
 
-    return escaped.replace(/\n/g, "<br>");
+    escaped = escaped.replace(/\n/g, "<br>");
+
+    return escaped.replace(/__MMI_HTML_TOKEN_(\d+)__/g, (match, index) => htmlTokens[Number(index)] || match);
   }
 
   function normalizePath(value) {
@@ -363,7 +457,7 @@
       lastRoom = current;
 
       const overlay = document.getElementById(OVERLAY_ID);
-      if (overlay) overlay.remove();
+      if (overlay) closeFullDialog();
     };
 
     window.addEventListener("hashchange", closeOnRoomChange, true);
@@ -380,7 +474,7 @@
     button.id = BUTTON_ID;
     button.className = "mmi-button";
     button.type = "button";
-    button.textContent = "🔗";
+    button.innerHTML = MAIN_BUTTON_ICON;
     button.title = "Import Mattermost export";
     button.setAttribute("aria-label", "Import Mattermost export");
 
@@ -1116,6 +1210,77 @@
     });
   }
 
+  function parseImportFromDate(value) {
+    const match = String(value || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+    if (!match) {
+      return null;
+    }
+
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(0);
+
+    date.setFullYear(year, month - 1, day);
+    date.setHours(0, 0, 0, 0);
+
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== month - 1 ||
+      date.getDate() !== day
+    ) {
+      return null;
+    }
+
+    return date.getTime();
+  }
+
+  function normalizeImportFromDateValue(value) {
+    const text = String(value || "").trim();
+
+    return parseImportFromDate(text) === null ? "" : text;
+  }
+
+  function importFromDateLabel(value) {
+    const timestamp = parseImportFromDate(value);
+
+    if (timestamp === null) {
+      return "";
+    }
+
+    return new Date(timestamp).toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    });
+  }
+
+  function filterPostsByImportFromDate(posts, value = state.config.importFromDate) {
+    const dateValue = normalizeImportFromDateValue(value);
+    const timestamp = parseImportFromDate(dateValue);
+
+    if (timestamp === null) {
+      return {
+        posts,
+        active: false,
+        dateValue: "",
+        label: "",
+        ignoredCount: 0
+      };
+    }
+
+    const filteredPosts = posts.filter(post => Number(post.create_at || 0) >= timestamp);
+
+    return {
+      posts: filteredPosts,
+      active: true,
+      dateValue,
+      label: importFromDateLabel(dateValue),
+      ignoredCount: posts.length - filteredPosts.length
+    };
+  }
+
   function isImageFile(fileInfo) {
     return String(fileInfo.mime_type || "").toLowerCase().startsWith("image/");
   }
@@ -1238,6 +1403,45 @@
     return `mm_gallery_${channel.id}_${post.id}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
 
+  function makePrimaryTextItemForPost(channel, post, includeOtherFiles) {
+    const images = imageFileInfos(post);
+    const otherFiles = includeOtherFiles ? otherFileInfos(post) : [];
+    const hasText = Boolean(String(post.message || "").trim());
+
+    if (images.length > 0) {
+      return makeTextItem(channel, post, {
+        fallbackText: `${images.length} image attachment${images.length === 1 ? "" : "s"}`
+      });
+    }
+
+    if (!hasText && otherFiles.length > 0) {
+      return makeTextItem(channel, post, {
+        fallbackText: `${otherFiles.length} file attachment${otherFiles.length === 1 ? "" : "s"}`
+      });
+    }
+
+    return makeTextItem(channel, post);
+  }
+
+  function importedContentFromBody(body) {
+    const value = String(body || "").replace(/\r\n/g, "\n").trim();
+    const splitAt = value.indexOf("\n");
+
+    return splitAt === -1 ? value : value.slice(splitAt + 1).trim();
+  }
+
+  function duplicateCheckForPost(channel, post, includeOtherFiles) {
+    const textItem = makePrimaryTextItemForPost(channel, post, includeOtherFiles);
+
+    return {
+      postId: post.id || "",
+      senderName: textItem.meta.sender_name || "",
+      createAt: textItem.meta.create_at || 0,
+      content: importedContentFromBody(textItem.body),
+      body: textItem.body
+    };
+  }
+
   async function buildItemsForPost(channel, post, includeOtherFiles) {
     const items = [];
     const images = imageFileInfos(post);
@@ -1247,15 +1451,17 @@
     if (images.length > 0) {
       const galleryId = createGalleryId(channel, post);
       const gallery = { id: galleryId, count: images.length };
+      const primaryTextItem = makePrimaryTextItemForPost(channel, post, includeOtherFiles);
 
-      items.push(makeTextItem(channel, post, {
-        fallbackText: `${images.length} image attachment${images.length === 1 ? "" : "s"}`,
+      items.push({
+        ...primaryTextItem,
         gallery,
         meta: {
+          ...primaryTextItem.meta,
           gallery_id: galleryId,
           gallery_count: images.length
         }
-      }));
+      });
 
       for (let index = 0; index < images.length; index++) {
         const fileInfo = images[index];
@@ -1277,14 +1483,12 @@
         }));
       }
     } else if (hasText || otherFiles.length === 0) {
-      items.push(makeTextItem(channel, post));
+      items.push(makePrimaryTextItemForPost(channel, post, includeOtherFiles));
     }
 
     if (otherFiles.length > 0) {
       if (!hasText && images.length === 0) {
-        items.push(makeTextItem(channel, post, {
-          fallbackText: `${otherFiles.length} file attachment${otherFiles.length === 1 ? "" : "s"}`
-        }));
+        items.push(makePrimaryTextItemForPost(channel, post, includeOtherFiles));
       }
 
       for (const fileInfo of otherFiles) {
@@ -1297,14 +1501,14 @@
     return items;
   }
 
-  function sendItemsViaPageBridge(room, items, log) {
-    const requestId = `mmi_send_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  function pageBridgeRequest({ type, responseType, requestIdPrefix, room, items = [], duplicateCheck = null, timeoutMs = 180000 }, log) {
+    const requestId = `${requestIdPrefix}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         cleanup();
-        reject(new Error("Live Element MatrixClient send timed out"));
-      }, 180000);
+        reject(new Error("Live Element MatrixClient request timed out"));
+      }, timeoutMs);
 
       const onMessage = event => {
         if (event.source !== window) return;
@@ -1316,13 +1520,13 @@
           return;
         }
 
-        if (event.data.type === PAGE_BRIDGE_SEND_RESPONSE) {
+        if (event.data.type === responseType) {
           cleanup();
 
           if (event.data.ok) {
             resolve(event.data.result || {});
           } else {
-            reject(new Error(event.data.error || "Live Element MatrixClient send failed"));
+            reject(new Error(event.data.error || "Live Element MatrixClient request failed"));
           }
         }
       };
@@ -1335,12 +1539,57 @@
       window.addEventListener("message", onMessage);
 
       window.postMessage({
-        type: PAGE_BRIDGE_SEND_REQUEST,
+        type,
         requestId,
         room,
-        items
+        items,
+        duplicateCheck
       }, window.location.origin);
     });
+  }
+
+  function checkDuplicateViaPageBridge(room, duplicateCheck, log) {
+    return pageBridgeRequest({
+      type: PAGE_BRIDGE_DUPLICATE_REQUEST,
+      responseType: PAGE_BRIDGE_DUPLICATE_RESPONSE,
+      requestIdPrefix: "mmi_duplicate",
+      room,
+      duplicateCheck,
+      timeoutMs: 180000
+    }, log);
+  }
+
+  function sendItemsViaPageBridge(room, items, log, duplicateCheck = null) {
+    return pageBridgeRequest({
+      type: PAGE_BRIDGE_SEND_REQUEST,
+      responseType: PAGE_BRIDGE_SEND_RESPONSE,
+      requestIdPrefix: "mmi_send",
+      room,
+      items,
+      duplicateCheck
+    }, log);
+  }
+
+  function updateProgressUi(root) {
+    if (!root) return;
+
+    const progress = state.importProgress;
+    const fill = qs(".mmi-progressbar-fill", root);
+    const label = qs(".mmi-progress-text", root);
+    const status = qs(".mmi-progress", root);
+
+    if (fill) {
+      fill.style.width = `${progress.percent}%`;
+      fill.setAttribute("aria-valuenow", String(progress.percent));
+    }
+
+    if (label) {
+      label.textContent = progress.label;
+    }
+
+    if (status && progress.text) {
+      status.textContent = progress.text;
+    }
   }
 
   function updateImportProgress(root, importedPosts, totalPosts, importedImages, totalImages, text = "") {
@@ -1355,6 +1604,16 @@
     const safeTotal = Math.max(1, totalPosts || 0);
     const percent = Math.max(0, Math.min(100, Math.round((importedPosts / safeTotal) * 100)));
 
+    state.importProgress = {
+      currentPosts: importedPosts,
+      totalPosts,
+      currentImages: importedImages,
+      totalImages,
+      percent,
+      label: `${percent}% - ${importedPosts}/${totalPosts} messages - ${importedImages}/${totalImages} images`,
+      text: text || state.importProgress.text
+    };
+
     if (fill) {
       fill.style.width = `${percent}%`;
       fill.setAttribute("aria-valuenow", String(percent));
@@ -1367,6 +1626,83 @@
     if (status && text) {
       status.textContent = text;
     }
+
+    updateProgressUi(document.getElementById(MINI_PROGRESS_ID));
+  }
+
+  function updateImportProgressText(text) {
+    state.importProgress = {
+      ...state.importProgress,
+      text
+    };
+
+    updateProgressUi(document.getElementById(OVERLAY_ID));
+    updateProgressUi(document.getElementById(MINI_PROGRESS_ID));
+  }
+
+  function removeElementById(id) {
+    const element = document.getElementById(id);
+    if (element) element.remove();
+  }
+
+  function removeMiniProgressDialog() {
+    removeElementById(MINI_PROGRESS_ID);
+  }
+
+  function ensureMiniProgressDialog() {
+    if (!state.importing || state.cancelRequested) return null;
+
+    const existing = document.getElementById(MINI_PROGRESS_ID);
+    if (existing) {
+      updateProgressUi(existing);
+      return existing;
+    }
+
+    const dialog = document.createElement("div");
+    dialog.id = MINI_PROGRESS_ID;
+    dialog.className = "mmi-mini-progress";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-label", "Mattermost import progress");
+    dialog.innerHTML = `
+      <div class="mmi-mini-progress-header">
+        <strong>Import in progress</strong>
+        <button class="mmi-cancel-button" id="mmi-mini-cancel" type="button">Cancel upload</button>
+      </div>
+      <div class="mmi-progress">Importing...</div>
+      <div class="mmi-progressbar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${state.importProgress.percent}">
+        <div class="mmi-progressbar-fill"></div>
+      </div>
+      <div class="mmi-progress-text">0% - 0/0 messages - 0/0 images</div>
+    `;
+
+    document.body.appendChild(dialog);
+    updateProgressUi(dialog);
+
+    qs("#mmi-mini-cancel", dialog).addEventListener("click", () => requestImportCancel(dialog));
+
+    return dialog;
+  }
+
+  function closeFullDialog() {
+    removeElementById(OVERLAY_ID);
+
+    if (state.importing && !state.cancelRequested) {
+      ensureMiniProgressDialog();
+    }
+  }
+
+  function closeImportDialogs() {
+    removeElementById(OVERLAY_ID);
+    removeMiniProgressDialog();
+  }
+
+  function requestImportCancel(root = null) {
+    if (!state.importing) return;
+
+    state.cancelRequested = true;
+    updateImportProgressText("Cancelling after the current Matrix send finishes...");
+    if (root) appendLog(root, "Cancel requested by user.");
+    closeImportDialogs();
   }
 
   function setImportControls(root, importing) {
@@ -1378,11 +1714,13 @@
     const importButton = qs("#mmi-import", root);
     const cancelButton = qs("#mmi-cancel", root);
     const otherFiles = qs("#mmi-other-files", root);
+    const importFrom = qs("#mmi-import-from", root);
 
     if (selectButton) selectButton.disabled = importing;
     if (importButton) importButton.disabled = importing || !state.loaded || !state.selectedChannel;
     if (cancelButton) cancelButton.disabled = !importing;
     if (otherFiles) otherFiles.disabled = importing;
+    if (importFrom) importFrom.disabled = importing;
   }
 
   async function importSelectedChannel(root) {
@@ -1399,19 +1737,28 @@
 
     try {
       const includeOtherFiles = qs("#mmi-other-files", root).checked;
+      const importFromDate = normalizeImportFromDateValue(qs("#mmi-import-from", root)?.value || "");
       state.config.includeOtherFiles = includeOtherFiles;
+      state.config.importFromDate = importFromDate;
       await saveConfig();
 
       const channel = state.selectedChannel;
       rememberSelection(state.selectedScope, channel);
-      const posts = await loadPostsForChannel(channel);
+      const allPosts = await loadPostsForChannel(channel);
+      const filterInfo = filterPostsByImportFromDate(allPosts, importFromDate);
+      const posts = filterInfo.posts;
       const stats = await countImportStats(posts);
+      const dateFilterText = filterInfo.active
+        ? `Import from: ${filterInfo.label} (${filterInfo.ignoredCount} earlier messages ignored)\n`
+        : "";
 
       updateImportProgress(root, 0, stats.messages, 0, stats.images, "Ready to import.");
 
       const confirmed = window.confirm(
         `Really import ${stats.messages} messages and ${stats.images} images into the current Matrix room?\n\n` +
         `Source: ${channelTitle(channel)}\n` +
+        dateFilterText +
+        `Duplicate check: author, content and Mattermost timestamp\n` +
         `Other exported files: ${includeOtherFiles ? stats.otherFiles : 0}\n` +
         `Missing exported files in selected folder: ${stats.missingFiles}`
       );
@@ -1422,8 +1769,11 @@
         return;
       }
 
-      qs("#mmi-status", root).textContent = "Importing…";
+      updateImportProgress(root, 0, stats.messages, 0, stats.images, "Importing...");
       appendLog(root, `Importing ${stats.messages} messages, ${stats.images} images into ${room}`);
+      if (filterInfo.active) {
+        appendLog(root, `Ignoring ${filterInfo.ignoredCount} messages before ${filterInfo.label}.`);
+      }
 
       const startItem = {
         kind: "text",
@@ -1437,23 +1787,62 @@
           channel_name: channelTitle(channel),
           message_count: stats.messages,
           image_count: stats.images,
-          other_file_count: includeOtherFiles ? stats.otherFiles : 0
+          other_file_count: includeOtherFiles ? stats.otherFiles : 0,
+          import_from_date: filterInfo.dateValue || undefined,
+          ignored_before_import_from_count: filterInfo.ignoredCount || undefined
         }
       };
 
       await sendItemsViaPageBridge(room, [startItem], text => appendLog(root, text));
 
+      let processedPosts = 0;
+      let processedImages = 0;
       let importedPosts = 0;
       let importedImages = 0;
       let importedFiles = 0;
+      let skippedPosts = 0;
+      let skippedImages = 0;
+      let skippedFiles = 0;
       let cancelled = false;
 
-      updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Importing…");
+      updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Importing...");
 
       for (const post of posts) {
         if (state.cancelRequested) {
           cancelled = true;
           appendLog(root, "Cancel requested. Stopping before next post.");
+          break;
+        }
+
+        const duplicateCheck = duplicateCheckForPost(channel, post, includeOtherFiles);
+        const postImages = imageFileInfos(post).length;
+        const postFiles = includeOtherFiles ? otherFileInfos(post).length : 0;
+        const duplicateResult = await checkDuplicateViaPageBridge(room, duplicateCheck, text => appendLog(root, text));
+
+        if (duplicateResult.duplicate) {
+          processedPosts += 1;
+          processedImages += postImages;
+          skippedPosts += 1;
+          skippedImages += postImages;
+          skippedFiles += postFiles;
+
+          updateImportProgress(
+            root,
+            processedPosts,
+            stats.messages,
+            processedImages,
+            stats.images,
+            `Checked ${processedPosts}/${stats.messages} messages. Imported ${importedPosts}, skipped ${skippedPosts}.`
+          );
+          appendLog(root, `Skipped duplicate post ${processedPosts}/${stats.messages}: ${post.id}`);
+
+          await sleep(25);
+          continue;
+        }
+
+        if (state.cancelRequested) {
+          cancelled = true;
+          appendLog(root, "Cancel requested. Stopping before reading post files.");
           break;
         }
 
@@ -1466,34 +1855,45 @@
         }
 
         if (items.length === 0) {
-          importedPosts += 1;
-          updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Importing…");
+          processedPosts += 1;
+          processedImages += postImages;
+          updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Importing...");
           continue;
         }
 
-        await sendItemsViaPageBridge(room, items, text => appendLog(root, text));
+        const sendResult = await sendItemsViaPageBridge(room, items, text => appendLog(root, text), duplicateCheck);
 
-        importedPosts += 1;
-        importedImages += imageFileInfos(post).length;
-        importedFiles += includeOtherFiles ? otherFileInfos(post).length : 0;
+        processedPosts += 1;
+        processedImages += postImages;
+
+        if (sendResult.duplicate) {
+          skippedPosts += 1;
+          skippedImages += postImages;
+          skippedFiles += postFiles;
+          appendLog(root, `Skipped duplicate post ${processedPosts}/${stats.messages}: ${post.id}`);
+        } else {
+          importedPosts += 1;
+          importedImages += postImages;
+          importedFiles += postFiles;
+          appendLog(root, `Imported post ${processedPosts}/${stats.messages}: ${post.id}`);
+        }
 
         updateImportProgress(
           root,
-          importedPosts,
+          processedPosts,
           stats.messages,
-          importedImages,
+          processedImages,
           stats.images,
-          `Imported ${importedPosts}/${stats.messages} messages, ${importedImages}/${stats.images} images.`
+          `Checked ${processedPosts}/${stats.messages} messages. Imported ${importedPosts}, skipped ${skippedPosts}.`
         );
-        appendLog(root, `Imported post ${importedPosts}/${stats.messages}: ${post.id}`);
 
         await sleep(100);
       }
 
       const finalType = cancelled || state.cancelRequested ? "import-cancelled" : "import-finished";
       const finalText = cancelled || state.cancelRequested
-        ? `Mattermost import cancelled: ${channelTitle(channel)} (${importedPosts}/${stats.messages} messages, ${importedImages}/${stats.images} images).`
-        : `Mattermost import finished: ${channelTitle(channel)} (${importedPosts} messages, ${importedImages} images, ${importedFiles} files).`;
+        ? `Mattermost import cancelled: ${channelTitle(channel)} (${processedPosts}/${stats.messages} checked, ${importedPosts} imported, ${skippedPosts} skipped).`
+        : `Mattermost import finished: ${channelTitle(channel)} (${importedPosts} imported, ${skippedPosts} skipped, ${importedImages} images, ${importedFiles} files).`;
 
       const finishItem = {
         kind: "text",
@@ -1507,22 +1907,29 @@
           channel_name: channelTitle(channel),
           message_count: importedPosts,
           image_count: importedImages,
-          other_file_count: importedFiles
+          other_file_count: importedFiles,
+          checked_message_count: processedPosts,
+          skipped_message_count: skippedPosts,
+          skipped_image_count: skippedImages,
+          skipped_other_file_count: skippedFiles,
+          import_from_date: filterInfo.dateValue || undefined,
+          ignored_before_import_from_count: filterInfo.ignoredCount || undefined
         }
       };
 
       await sendItemsViaPageBridge(room, [finishItem], text => appendLog(root, text));
 
       if (cancelled || state.cancelRequested) {
-        updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Cancelled.");
+        updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Cancelled.");
         appendLog(root, "Import cancelled.");
       } else {
-        updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Done.");
-        appendLog(root, "Import finished.");
+        updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Done.");
+        appendLog(root, `Import finished. Imported ${importedPosts}, skipped ${skippedPosts}.`);
       }
     } finally {
       state.importing = false;
       state.cancelRequested = false;
+      removeMiniProgressDialog();
       setImportControls(root, false);
     }
   }
@@ -1622,13 +2029,22 @@
       </div>
     `;
 
-    const posts = await loadPostsForChannel(state.selectedChannel);
+    const allPosts = await loadPostsForChannel(state.selectedChannel);
+    const filterInfo = filterPostsByImportFromDate(allPosts);
+    const posts = filterInfo.posts;
     const stats = await countImportStats(posts);
+    const dateRows = filterInfo.active
+      ? `
+        <div class="mmi-preview-row"><span>Import from</span><span>${escapeHtml(filterInfo.label)}</span></div>
+        <div class="mmi-preview-row"><span>Ignored earlier messages</span><strong>${filterInfo.ignoredCount}</strong></div>
+      `
+      : "";
 
     preview.innerHTML = `
       <div class="mmi-preview-card">
         <h4>${escapeHtml(channelTitle(state.selectedChannel))}</h4>
-        <div class="mmi-preview-row"><span>Messages</span><strong>${stats.messages}</strong></div>
+        <div class="mmi-preview-row"><span>Messages to import</span><strong>${stats.messages}</strong></div>
+        ${dateRows}
         <div class="mmi-preview-row"><span>Images</span><strong>${stats.images}</strong></div>
         <div class="mmi-preview-row"><span>Other exported files</span><strong>${stats.otherFiles}</strong></div>
         <div class="mmi-preview-row"><span>Missing files</span><strong>${stats.missingFiles}</strong></div>
@@ -1648,6 +2064,15 @@
 
   function openModal() {
     const existing = document.getElementById(OVERLAY_ID);
+
+    if (state.importing) {
+      if (existing) {
+        closeFullDialog();
+      } else {
+        ensureMiniProgressDialog();
+      }
+      return;
+    }
 
     if (existing) {
       existing.remove();
@@ -1676,9 +2101,9 @@
 
         <div class="mmi-controls">
           <button id="mmi-select-folder">Select export folder metadata</button>
+          <div class="mmi-small" id="mmi-folder-hint">${escapeHtml(exportFolderHintText())}</div>
           <label><input id="mmi-other-files" type="checkbox" ${state.config.includeOtherFiles ? "checked" : ""}> Import non-image files if present</label>
-          <label><input id="mmi-remember-folder" type="checkbox" ${state.config.rememberExportFolder ? "checked" : ""}> Reuse this export folder next time</label>
-          <div class="mmi-small" id="mmi-folder-hint">${state.config.lastExportFolderName ? "Last export folder: " + escapeHtml(state.config.lastExportFolderName) : "No export folder remembered yet."}</div>
+          <label>Import from <input id="mmi-import-from" type="date" value="${escapeHtml(state.config.importFromDate)}"></label>
         </div>
 
         <div class="mmi-body">
@@ -1719,18 +2144,20 @@
     document.body.appendChild(overlay);
     updateSessionUiIfOpen();
 
-    qs("#mmi-close", overlay).addEventListener("click", () => overlay.remove());
+    qs("#mmi-close", overlay).addEventListener("click", () => closeFullDialog());
 
-    qs("#mmi-remember-folder", overlay).addEventListener("change", async event => {
-      state.config.rememberExportFolder = Boolean(event.target.checked);
+    qs("#mmi-import-from", overlay).addEventListener("change", async event => {
+      state.config.importFromDate = normalizeImportFromDateValue(event.target.value);
+      event.target.value = state.config.importFromDate;
       await saveConfig();
+      renderLoadedUi(overlay);
     });
 
     qs("#mmi-select-folder", overlay).addEventListener("click", async () => {
       try {
         qs("#mmi-status", overlay).textContent = "Opening local export folder…";
 
-        state.config.rememberExportFolder = qs("#mmi-remember-folder", overlay).checked;
+        state.config.rememberExportFolder = true;
         await saveConfig();
 
         await selectExportFolderLazily();
@@ -1738,7 +2165,7 @@
         const suggestion = applyContextSuggestion(overlay, "current Matrix room/space values");
 
         qs("#mmi-import", overlay).disabled = !state.selectedChannel;
-        qs("#mmi-folder-hint", overlay).textContent = `Current export folder: ${state.rootName}`;
+        qs("#mmi-folder-hint", overlay).textContent = exportFolderHintText();
         appendLog(overlay, `Loaded metadata only: ${state.rootName}`);
         if (suggestion) appendLog(overlay, suggestionDescription(suggestion));
         appendLog(overlay, "No post chunks or assets have been read until preview/import.");
@@ -1760,10 +2187,7 @@
     });
 
     qs("#mmi-cancel", overlay).addEventListener("click", () => {
-      if (!state.importing) return;
-      state.cancelRequested = true;
-      qs("#mmi-status", overlay).textContent = "Cancelling after the current Matrix send finishes…";
-      appendLog(overlay, "Cancel requested by user.");
+      requestImportCancel(overlay);
     });
 
     overlay.addEventListener("click", event => {
@@ -1805,7 +2229,7 @@
           if (!loaded) return;
 
           const suggestion = applyContextSuggestion(overlay, "current Matrix room/space values");
-          qs("#mmi-folder-hint", overlay).textContent = `Current export folder: ${state.rootName}`;
+          qs("#mmi-folder-hint", overlay).textContent = exportFolderHintText();
           appendLog(overlay, `Reused stored export folder: ${state.rootName}`);
           if (suggestion) appendLog(overlay, suggestionDescription(suggestion));
           renderLoadedUi(overlay);
