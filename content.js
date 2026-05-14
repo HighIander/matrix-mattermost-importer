@@ -1851,6 +1851,21 @@
     closeImportDialogs();
   }
 
+  function updateCloseButtonForImportState(root = document) {
+    const closeButton = qs("#mmi-close", root);
+    if (!closeButton) return;
+
+    if (state.importing) {
+      closeButton.textContent = "-";
+      closeButton.title = "Minimize import dialog";
+      closeButton.setAttribute("aria-label", "Minimize import dialog");
+    } else {
+      closeButton.textContent = "×";
+      closeButton.title = "Close";
+      closeButton.setAttribute("aria-label", "Close");
+    }
+  }
+
   function setImportControls(root, importing) {
     /*
      * Disable operations that could change the selected channel while an import
@@ -1867,6 +1882,8 @@
     if (cancelButton) cancelButton.disabled = !importing;
     if (otherFiles) otherFiles.disabled = importing;
     if (importFrom) importFrom.disabled = importing;
+
+    updateCloseButtonForImportState(root);
   }
 
   function confirmImportAfterScrollWarning(root, details) {
@@ -1895,11 +1912,11 @@
           <h3 id="mmi-import-warning-title">Scroll to the beginning before importing</h3>
           <p>
             The duplicate check compares the Mattermost export against the Matrix messages that are available in this Element room.
+            Scrolling to the top is necessary because Matrix/Element only loads older messages into the browser as you paginate upward.
             For the check to be complete, scroll up to the beginning of the Matrix chat before starting the import.
           </p>
           <p>
             If you proceed without doing that, older duplicates may not be detected and can be imported again.
-            The importer no longer applies an artificial limit to the number of older Matrix messages it checks.
           </p>
           <div class="mmi-import-warning-summary">
             <strong>Pending import</strong>

@@ -626,6 +626,77 @@
     return content;
   }
 
+  function addThreadFallbackLabel(content, thread) {
+    if (!thread?.rootEventId || !content || typeof content !== "object") {
+      return content;
+    }
+
+    const textLabel = "Thread:";
+    const htmlLabel = "<strong>Thread:</strong>";
+    const msgtype = String(content.msgtype || "");
+
+    if (msgtype === "m.text" || msgtype === "m.notice" || content.formatted_body) {
+      const body = String(content.body || "");
+
+      if (!body.startsWith(`${textLabel}\n`)) {
+        content.body = `${textLabel}\n${body}`.trimEnd();
+      }
+
+      if (!content.formatted_body) {
+        content.format = "org.matrix.custom.html";
+        content.formatted_body = escapeHtml(body);
+      }
+
+      if (!String(content.formatted_body || "").startsWith(htmlLabel)) {
+        content.format = "org.matrix.custom.html";
+        content.formatted_body = `${htmlLabel}<br>${content.formatted_body || ""}`;
+      }
+
+      return content;
+    }
+
+    if ((msgtype === "m.image" || msgtype === "m.file") && content.body) {
+      const body = String(content.body || "");
+      if (!body.startsWith(`${textLabel} `)) {
+        content.body = `${textLabel} ${body}`;
+      }
+    }
+
+    return content;
+  }
+
+  function cloneMessageContent(content) {
+    try {
+      return structuredClone(content);
+    } catch {
+      return JSON.parse(JSON.stringify(content));
+    }
+  }
+
+  function shouldUseThreadAwareSend(client, thread) {
+    return Boolean(
+      thread?.rootEventId &&
+      String(thread.rootEventId).startsWith("$") &&
+      client &&
+      typeof client.sendMessage === "function"
+    );
+  }
+
+  async function sendMessageToRoom(client, roomId, content, thread) {
+    if (shouldUseThreadAwareSend(client, thread)) {
+      /*
+       * Current matrix-js-sdk versions have a thread-aware overload:
+       * sendMessage(roomId, threadId, content). Using it lets Element update
+       * its local thread model immediately instead of treating the local echo
+       * like a plain timeline message until the user opens the thread. The SDK
+       * adds the Matrix m.thread relation when it is missing.
+       */
+      return client.sendMessage(roomId, thread.rootEventId, cloneMessageContent(content));
+    }
+
+    return client.sendMessage(roomId, addThreadRelation(cloneMessageContent(content), thread));
+  }
+
   function normalizeDuplicateText(value) {
     return String(value || "")
       .replace(/\r\n/g, "\n")
@@ -1025,8 +1096,8 @@
       content.formatted_body = `${content.formatted_body || escapeHtml(content.body)}${makeGalleryHtmlMetadata(item.gallery.id, "caption", -1, item.gallery.count)}`;
     }
 
-    const eventContent = addMattermostMetadata(addThreadRelation(content, threadContext), item.meta);
-    const result = await withRateLimitRetry("sending text", requestId, () => client.sendMessage(roomId, eventContent));
+    const eventContent = addMattermostMetadata(addThreadFallbackLabel(content, threadContext), item.meta);
+    const result = await withRateLimitRetry("sending text", requestId, () => sendMessageToRoom(client, roomId, eventContent, threadContext));
 
     return eventIdFromSendResult(result);
   }
@@ -1069,8 +1140,8 @@
     }
 
     postProgress(requestId, `Sende Datei: ${content.body}`);
-    const eventContent = addMattermostMetadata(addThreadRelation(content, threadContext), item.meta);
-    const result = await withRateLimitRetry(`sending file ${content.body}`, requestId, () => client.sendMessage(roomId, eventContent));
+    const eventContent = addMattermostMetadata(addThreadFallbackLabel(content, threadContext), item.meta);
+    const result = await withRateLimitRetry(`sending file ${content.body}`, requestId, () => sendMessageToRoom(client, roomId, eventContent, threadContext));
 
     return eventIdFromSendResult(result);
   }
