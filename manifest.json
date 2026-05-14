@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Matrix Mattermost Lazy Local Importer",
+  "version": "0.3.0",
+  "description": "Lazily imports one selected local Mattermost export channel into the current Matrix/Element room using the live Element MatrixClient.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://app.element.io/*",
+    "https://*.element.io/*",
+    "https://matrix.helmholtz.cloud/*",
+    "https://matrix-client.matrix.org/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page-bridge.js"
+      ],
+      "matches": [
+        "https://app.element.io/*",
+        "https://*.element.io/*",
+        "https://matrix.helmholtz.cloud/*"
+      ]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.element.io/*",
+        "https://*.element.io/*",
+        "https://matrix.helmholtz.cloud/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "minimum_chrome_version": "114",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "matrix-mattermost-importer@tkluge.de",
+      "strict_min_version": "121.0"
+    }
+  }
+}
