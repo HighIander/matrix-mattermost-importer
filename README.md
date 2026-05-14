@@ -1,4 +1,4 @@
-# Matrix Gallery v0.31.0
+# Matrix Gallery
 
 This extension imports chat data exported with the mattermost-exporter extension (https://github.com/HighIander/mattermost-exporter) into a single matrix chat and is compatible with the matrix-gallery extension (https://github.com/HighIander/matrix-gallery). 
 
@@ -20,7 +20,7 @@ Licence: None (use as you like). No liability is taken by the author!
 
 ## Installation
 
-0. Download all files from this repository into a directory on your computer, e.g. to [downloads/matrix-mattermost-importer]
+0. Download all files from this repository into a directory on your computer, e.g. to [downloads/matrix-mattermost-importer]. You can download a zip file and extract it on your computer from the latest release here: https://github.com/HighIander/matrix-gallery/releases
 
 
 ### Chrome/Edge
