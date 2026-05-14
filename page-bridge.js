@@ -190,6 +190,131 @@
     return findClientFromKnownGlobals() || findClientFromWebpack() || null;
   }
 
+  function detectCurrentRoomIdOrAlias() {
+    const hash = window.location.hash || "";
+    const match = hash.match(/\/room\/([^/?#]+)/);
+
+    if (match) {
+      return decodeURIComponent(match[1]);
+    }
+
+    const pathMatch = window.location.pathname.match(/\/room\/([^/?#]+)/);
+
+    if (pathMatch) {
+      return decodeURIComponent(pathMatch[1]);
+    }
+
+    return "";
+  }
+
+  function getRoomByIdOrAlias(client, roomIdOrAlias) {
+    if (!client || !roomIdOrAlias) return null;
+
+    try {
+      const direct = client.getRoom?.(roomIdOrAlias);
+      if (direct) return direct;
+    } catch {}
+
+    try {
+      const rooms = client.getRooms?.() || [];
+
+      return rooms.find(room => {
+        const roomId = room?.roomId || room?.room_id || "";
+        const canonicalAlias = room?.getCanonicalAlias?.() || "";
+        const altAliases = room?.getAltAliases?.() || [];
+
+        return roomId === roomIdOrAlias ||
+          canonicalAlias === roomIdOrAlias ||
+          altAliases.includes(roomIdOrAlias);
+      }) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function roomName(room) {
+    if (!room) return "";
+
+    try {
+      return room.name || room.getDefaultRoomName?.() || room.currentState?.getStateEvents?.("m.room.name", "")?.getContent?.()?.name || "";
+    } catch {
+      return room.name || "";
+    }
+  }
+
+  function roomAliases(room) {
+    if (!room) return [];
+
+    const aliases = new Set();
+
+    try {
+      const canonical = room.getCanonicalAlias?.();
+      if (canonical) aliases.add(canonical);
+    } catch {}
+
+    try {
+      for (const alias of room.getAltAliases?.() || []) {
+        if (alias) aliases.add(alias);
+      }
+    } catch {}
+
+    try {
+      const event = room.currentState?.getStateEvents?.("m.room.canonical_alias", "");
+      const content = event?.getContent?.() || {};
+      if (content.alias) aliases.add(content.alias);
+      for (const alias of content.alt_aliases || []) aliases.add(alias);
+    } catch {}
+
+    return [...aliases];
+  }
+
+  function parentSpaceNames(client, room) {
+    if (!client || !room) return [];
+
+    const names = new Set();
+    const parentIds = new Set();
+
+    try {
+      const events = room.currentState?.getStateEvents?.("m.space.parent") || [];
+      for (const event of events) {
+        const stateKey = event?.getStateKey?.() || event?.event?.state_key || "";
+        if (stateKey) parentIds.add(stateKey);
+      }
+    } catch {}
+
+    try {
+      for (const candidate of client.getRooms?.() || []) {
+        const children = candidate?.currentState?.getStateEvents?.("m.space.child") || [];
+        for (const childEvent of children) {
+          const stateKey = childEvent?.getStateKey?.() || childEvent?.event?.state_key || "";
+          if (stateKey && stateKey === room.roomId) {
+            parentIds.add(candidate.roomId);
+          }
+        }
+      }
+    } catch {}
+
+    for (const parentId of parentIds) {
+      const parentRoom = getRoomByIdOrAlias(client, parentId);
+      const name = roomName(parentRoom);
+      if (name) names.add(name);
+    }
+
+    return [...names];
+  }
+
+  function currentRoomInfo(client) {
+    const roomIdOrAlias = detectCurrentRoomIdOrAlias();
+    const room = getRoomByIdOrAlias(client, roomIdOrAlias);
+
+    return {
+      currentRoomId: room?.roomId || roomIdOrAlias || "",
+      currentRoomName: roomName(room),
+      currentRoomAliases: roomAliases(room),
+      spaceNames: parentSpaceNames(client, room)
+    };
+  }
+
   function postSession(reason) {
     const client = findClient();
 
@@ -205,7 +330,10 @@
       return;
     }
 
-    lastSession = sessionFromClient(client) || {};
+    lastSession = {
+      ...(sessionFromClient(client) || {}),
+      ...currentRoomInfo(client)
+    };
 
     window.postMessage({
       source: SOURCE,

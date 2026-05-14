@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Matrix Mattermost Lazy Local Importer",
-  "version": "0.3.0",
-  "description": "Lazily imports one selected local Mattermost export channel into the current Matrix/Element room using the live Element MatrixClient.",
+  "version": "0.7.0",
+  "description": "Lazily imports one selected local Mattermost export channel into the current Matrix/Element room, with folder reuse, last-team-aware fuzzy suggestions, links, emojis, progress and cancellation.",
   "permissions": [
     "storage"
   ],

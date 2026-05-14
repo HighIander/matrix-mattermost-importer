@@ -7,7 +7,10 @@
 
   window.__matrixMattermostImporterInitialized = true;
 
-  const STORAGE_KEY = "matrix_mattermost_importer_config_v2";
+  const STORAGE_KEY = "matrix_mattermost_importer_config_v3";
+  const IDB_NAME = "matrix_mattermost_importer_handles";
+  const IDB_STORE = "handles";
+  const IDB_EXPORT_ROOT_KEY = "exportRoot";
   const BUTTON_ID = "mmi-button";
   const OVERLAY_ID = "mmi-overlay";
   const PAGE_BRIDGE_SOURCE = "matrix-mattermost-importer-page-bridge";
@@ -20,7 +23,14 @@
   const DEFAULT_CONFIG = {
     buttonRight: 18,
     buttonBottom: 76,
-    includeOtherFiles: true
+    includeOtherFiles: true,
+    rememberExportFolder: true,
+    lastExportFolderName: "",
+    lastSelectedScopeType: "",
+    lastSelectedScopeId: "",
+    lastSelectedScopeTitle: "",
+    lastSelectedChannelId: "",
+    lastSelectedChannelTitle: ""
   };
 
   const state = {
@@ -38,7 +48,11 @@
     postsCache: new Map(),
     pageSession: null,
     loaded: false,
-    importing: false
+    importing: false,
+    cancelRequested: false,
+    pendingContextSuggestion: false,
+    manualSelectionAfterOpen: false,
+    lastSuggestion: null
   };
 
   injectPageBridge();
@@ -66,6 +80,7 @@
       if (event.data.type === PAGE_BRIDGE_SESSION_RESPONSE && event.data.ok) {
         state.pageSession = event.data.session || null;
         updateSessionUiIfOpen();
+        applyPendingContextSuggestionIfOpen();
       }
     });
 
@@ -104,6 +119,145 @@
     await chromeStorageSet({ [STORAGE_KEY]: state.config });
   }
 
+  function isLastSelectedScope(scope) {
+    /*
+     * Ambiguous Mattermost channel names are common across teams, especially
+     * town-square/off-topic style channels. Remembering the last manually used
+     * team gives the guesser a stable tie-breaker without forcing a selection
+     * when the current Matrix space clearly points elsewhere.
+     */
+    return Boolean(
+      scope &&
+      state.config.lastSelectedScopeType &&
+      state.config.lastSelectedScopeId &&
+      scope.type === state.config.lastSelectedScopeType &&
+      scope.id === state.config.lastSelectedScopeId
+    );
+  }
+
+  function rememberSelection(scope, channel) {
+    if (!scope) {
+      return;
+    }
+
+    state.config.lastSelectedScopeType = scope.type || "";
+    state.config.lastSelectedScopeId = scope.id || "";
+    state.config.lastSelectedScopeTitle = scope.title || "";
+
+    if (channel) {
+      state.config.lastSelectedChannelId = channel.id || "";
+      state.config.lastSelectedChannelTitle = channelTitle(channel) || "";
+    }
+
+    saveConfig().catch(error => {
+      console.warn("Could not store last Mattermost selection.", error);
+    });
+  }
+
+  function openHandleDatabase() {
+    /*
+     * FileSystemDirectoryHandle is structured-cloneable and can be stored in
+     * IndexedDB. Permission can still expire; in that case the user is asked
+     * to select the folder again.
+     */
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(IDB_NAME, 1);
+
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("Could not open IndexedDB."));
+    });
+  }
+
+  async function idbGet(key) {
+    const db = await openHandleDatabase();
+
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const store = tx.objectStore(IDB_STORE);
+      const request = store.get(key);
+
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error || new Error("Could not read stored folder handle."));
+      tx.oncomplete = () => db.close();
+    });
+  }
+
+  async function idbSet(key, value) {
+    const db = await openHandleDatabase();
+
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      const store = tx.objectStore(IDB_STORE);
+      const request = store.put(value, key);
+
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error || new Error("Could not store folder handle."));
+      tx.oncomplete = () => db.close();
+    });
+  }
+
+  async function ensureReadPermission(handle) {
+    if (!handle || typeof handle.queryPermission !== "function") {
+      return false;
+    }
+
+    const options = { mode: "read" };
+    const current = await handle.queryPermission(options);
+
+    if (current === "granted") {
+      return true;
+    }
+
+    if (typeof handle.requestPermission === "function") {
+      const requested = await handle.requestPermission(options);
+      return requested === "granted";
+    }
+
+    return false;
+  }
+
+  async function rememberExportFolderHandle(handle) {
+    if (!state.config.rememberExportFolder || !handle) {
+      return;
+    }
+
+    try {
+      await idbSet(IDB_EXPORT_ROOT_KEY, handle);
+      state.config.lastExportFolderName = handle.name || "Mattermost export";
+      await saveConfig();
+    } catch (error) {
+      console.warn("Could not store export folder handle.", error);
+    }
+  }
+
+  async function loadRememberedExportFolderHandle() {
+    try {
+      const handle = await idbGet(IDB_EXPORT_ROOT_KEY);
+
+      if (!handle) {
+        return null;
+      }
+
+      const permitted = await ensureReadPermission(handle);
+
+      if (!permitted) {
+        return null;
+      }
+
+      return handle;
+    } catch (error) {
+      console.warn("Could not reuse stored export folder handle.", error);
+      return null;
+    }
+  }
+
   function escapeHtml(value) {
     return String(value ?? "")
       .replaceAll("&", "&amp;")
@@ -113,15 +267,60 @@
       .replaceAll("'", "&#039;");
   }
 
-  function htmlFromPlainText(value) {
-    const escaped = escapeHtml(String(value || "").replace(/\r\n/g, "\n"));
+  function convertCommonEmojiShortcodes(value) {
+    /*
+     * This covers common Mattermost/Slack-style emoji shortcodes. Custom
+     * workspace emoji cannot be reconstructed from the static export unless
+     * their image assets were exported separately.
+     */
+    const map = {
+      ":smile:": "😄", ":smiley:": "😃", ":grin:": "😁", ":laughing:": "😆",
+      ":joy:": "😂", ":rofl:": "🤣", ":wink:": "😉", ":blush:": "😊",
+      ":slight_smile:": "🙂", ":thinking_face:": "🤔", ":neutral_face:": "😐",
+      ":cry:": "😢", ":sob:": "😭", ":angry:": "😠", ":heart:": "❤️",
+      ":blue_heart:": "💙", ":green_heart:": "💚", ":yellow_heart:": "💛",
+      ":thumbsup:": "👍", ":+1:": "👍", ":thumbsdown:": "👎", ":-1:": "👎",
+      ":clap:": "👏", ":pray:": "🙏", ":ok_hand:": "👌", ":muscle:": "💪",
+      ":eyes:": "👀", ":fire:": "🔥", ":rocket:": "🚀", ":tada:": "🎉",
+      ":warning:": "⚠️", ":information_source:": "ℹ️", ":white_check_mark:": "✅",
+      ":x:": "❌", ":heavy_check_mark:": "✔️", ":star:": "⭐", ":sparkles:": "✨"
+    };
 
-    return escaped
-      .replace(
-        /(https?:\/\/[^\s<]+)/g,
-        '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
-      )
-      .replace(/\n/g, "<br>");
+    return String(value || "").replace(/:[+\-a-zA-Z0-9_]+:/g, token => map[token] || token);
+  }
+
+  function htmlFromPlainText(value) {
+    /*
+     * Preserve the most common Mattermost link forms when importing into
+     * Matrix HTML: Markdown links, autolinks, bare URLs, line breaks, and
+     * common emoji shortcodes. HTML from Mattermost messages is never trusted;
+     * all non-generated content is escaped.
+     */
+    let text = convertCommonEmojiShortcodes(String(value || "").replace(/\r\n/g, "\n"));
+    const linkTokens = [];
+
+    text = text.replace(/\[([^\]\n]{1,300})\]\((https?:\/\/[^\s)]+)\)/g, (match, label, url) => {
+      const token = `__MMI_LINK_${linkTokens.length}__`;
+      linkTokens.push(`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`);
+      return token;
+    });
+
+    text = text.replace(/<((?:https?:\/\/)[^>\s]+)>/g, (match, url) => {
+      const token = `__MMI_LINK_${linkTokens.length}__`;
+      linkTokens.push(`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`);
+      return token;
+    });
+
+    let escaped = escapeHtml(text);
+
+    escaped = escaped.replace(
+      /(https?:\/\/[^\s<]+)/g,
+      '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+    );
+
+    escaped = escaped.replace(/__MMI_LINK_(\d+)__/g, (match, index) => linkTokens[Number(index)] || match);
+
+    return escaped.replace(/\n/g, "<br>");
   }
 
   function normalizePath(value) {
@@ -181,7 +380,7 @@
     button.id = BUTTON_ID;
     button.className = "mmi-button";
     button.type = "button";
-    button.textContent = "MM";
+    button.textContent = "🔗";
     button.title = "Import Mattermost export";
     button.setAttribute("aria-label", "Import Mattermost export");
 
@@ -331,6 +530,22 @@
     state.rootHandle = handle;
     state.rootName = handle.name || "Mattermost export";
     state.lazyFolderMode = true;
+    await rememberExportFolderHandle(handle);
+  }
+
+  async function useRememberedExportFolderIfAvailable() {
+    const handle = await loadRememberedExportFolderHandle();
+
+    if (!handle) {
+      return false;
+    }
+
+    resetLoadedExportState();
+    state.rootHandle = handle;
+    state.rootName = handle.name || state.config.lastExportFolderName || "Mattermost export";
+    state.lazyFolderMode = true;
+    await loadExportFromSelectedFolder();
+    return true;
   }
 
   async function fileFromDirectoryPath(relativePath) {
@@ -547,6 +762,330 @@
     return type || "unknown";
   }
 
+  function normalizeForSuggestion(value) {
+    /*
+     * This keeps words but treats punctuation-only naming differences as
+     * insignificant. Examples that become equivalent enough for matching:
+     *   "Laser_Plasma" / "laser-plasma" / "laser plasma"
+     *   "team.channel" / "team_channel"
+     */
+    return String(value || "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[#@!:.(),;\[\]{}<>_\-\/\\|+~]+/g, " ")
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function compactForSuggestion(value) {
+    /*
+     * Compact matching is specifically for names that differ only by
+     * underscores, hyphens, dots, slashes, or spaces.
+     */
+    return normalizeForSuggestion(value).replace(/\s+/g, "");
+  }
+
+  function suggestionTokens(value) {
+    return normalizeForSuggestion(value)
+      .split(" ")
+      .filter(token => token.length >= 2);
+  }
+
+  function levenshteinDistance(a, b) {
+    /*
+     * Small dynamic-programming edit distance used only for short normalized
+     * names, so it is cheap enough for interactive suggestion scoring.
+     */
+    a = String(a || "");
+    b = String(b || "");
+
+    if (a === b) return 0;
+    if (!a) return b.length;
+    if (!b) return a.length;
+
+    const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    const current = new Array(b.length + 1);
+
+    for (let i = 1; i <= a.length; i++) {
+      current[0] = i;
+
+      for (let j = 1; j <= b.length; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        current[j] = Math.min(
+          previous[j] + 1,
+          current[j - 1] + 1,
+          previous[j - 1] + cost
+        );
+      }
+
+      for (let j = 0; j <= b.length; j++) {
+        previous[j] = current[j];
+      }
+    }
+
+    return previous[b.length];
+  }
+
+  function similarityRatio(a, b) {
+    const maxLen = Math.max(String(a || "").length, String(b || "").length, 1);
+    return 1 - levenshteinDistance(a, b) / maxLen;
+  }
+
+  function tokenOverlapScore(context, candidate) {
+    const contextTokens = suggestionTokens(context);
+    const candidateTokens = suggestionTokens(candidate);
+
+    if (contextTokens.length === 0 || candidateTokens.length === 0) {
+      return 0;
+    }
+
+    let matched = 0;
+
+    for (const candidateToken of candidateTokens) {
+      const exact = contextTokens.includes(candidateToken);
+
+      if (exact) {
+        matched += 1;
+        continue;
+      }
+
+      /*
+       * Allow tiny spelling/punctuation-induced differences in individual
+       * words, but avoid matching very short tokens too aggressively.
+       */
+      const fuzzy = contextTokens.some(contextToken => {
+        if (candidateToken.length < 4 || contextToken.length < 4) return false;
+        if (Math.abs(candidateToken.length - contextToken.length) > 2) return false;
+        return similarityRatio(candidateToken, contextToken) >= 0.78;
+      });
+
+      if (fuzzy) {
+        matched += 0.75;
+      }
+    }
+
+    return 70 * matched / Math.max(candidateTokens.length, 1);
+  }
+
+  function scoreOneSuggestionText(contextText, candidateTitle, extra = []) {
+    const context = normalizeForSuggestion(contextText);
+    const candidate = normalizeForSuggestion([candidateTitle, ...extra].join(" "));
+    const contextCompact = compactForSuggestion(contextText);
+    const candidateCompact = compactForSuggestion([candidateTitle, ...extra].join(" "));
+
+    if (!context || !candidate) {
+      return 0;
+    }
+
+    let score = 0;
+
+    if (contextCompact && candidateCompact && contextCompact === candidateCompact) {
+      score += 140;
+    }
+
+    if (contextCompact && candidateCompact) {
+      if (contextCompact.includes(candidateCompact)) score += 105;
+      if (candidateCompact.includes(contextCompact)) score += 75;
+
+      const ratio = similarityRatio(contextCompact, candidateCompact);
+      if (Math.min(contextCompact.length, candidateCompact.length) >= 5 && ratio >= 0.76) {
+        score += 85 * ratio;
+      }
+    }
+
+    if (context.includes(candidate)) score += 80;
+    if (candidate.includes(context)) score += 55;
+
+    score += tokenOverlapScore(context, candidate);
+
+    return score;
+  }
+
+  function scoreSuggestion(texts, title, extra = []) {
+    const candidates = [title, ...extra].filter(Boolean);
+    const sourceTexts = (texts || []).filter(Boolean);
+
+    if (sourceTexts.length === 0 || candidates.length === 0) {
+      return 0;
+    }
+
+    let best = 0;
+
+    for (const text of sourceTexts) {
+      for (const candidate of candidates) {
+        best = Math.max(best, scoreOneSuggestionText(text, candidate, []));
+      }
+
+      best = Math.max(best, scoreOneSuggestionText(text, title, extra));
+    }
+
+    return best;
+  }
+
+  function currentMatrixContextParts() {
+    const session = state.pageSession || {};
+
+    const roomTexts = [
+      session.currentRoomId || "",
+      session.currentRoomName || "",
+      ...(Array.isArray(session.currentRoomAliases) ? session.currentRoomAliases : [])
+    ].filter(Boolean);
+
+    const spaceTexts = [
+      ...(Array.isArray(session.spaceNames) ? session.spaceNames : [])
+    ].filter(Boolean);
+
+    const domTexts = [
+      document.title || "",
+      document.querySelector('[aria-label="Room name"]')?.textContent || "",
+      document.querySelector('[class*=RoomHeader] h2')?.textContent || "",
+      document.querySelector('[data-testid*=room]')?.textContent || ""
+    ].filter(Boolean);
+
+    const allTexts = [...roomTexts, ...spaceTexts, ...domTexts].filter(Boolean);
+
+    return { roomTexts, spaceTexts, domTexts, allTexts };
+  }
+
+  function currentMatrixContextTexts() {
+    return currentMatrixContextParts().allTexts;
+  }
+
+  function suggestionDescription(suggestion) {
+    if (!suggestion) {
+      return "No confident Mattermost team/channel guess.";
+    }
+
+    const team = suggestion.scope ? suggestion.scope.title : "unknown team";
+    const channel = suggestion.channel ? channelTitle(suggestion.channel) : "unknown channel";
+    const quality = suggestion.quality || "guess";
+    const tieBreaker = suggestion.usedLastSelectedTeam ? " · last selected team tie-breaker" : "";
+
+    return `Guessed team: ${team} · channel: ${channel} · ${quality} match${tieBreaker}`;
+  }
+
+  function suggestTeamAndChannelFromCurrentMatrixContext() {
+    if (!state.loaded || state.scopes.length === 0) {
+      state.lastSuggestion = null;
+      return null;
+    }
+
+    const parts = currentMatrixContextParts();
+    const roomTexts = [...parts.roomTexts, ...parts.domTexts].filter(Boolean);
+    const spaceTexts = parts.spaceTexts;
+    const allTexts = parts.allTexts;
+
+    let best = null;
+
+    for (const scope of state.scopes) {
+      const scopePrimaryTexts = spaceTexts.length > 0 ? spaceTexts : allTexts;
+      const scopeScore = scoreSuggestion(scopePrimaryTexts, scope.title, [scope.subtitle]);
+      const fallbackScopeScore = spaceTexts.length > 0 ? scoreSuggestion(allTexts, scope.title, [scope.subtitle]) * 0.55 : 0;
+      const effectiveScopeScore = Math.max(scopeScore, fallbackScopeScore);
+
+      for (const channel of channelsForScope(scope)) {
+        const channelScore = scoreSuggestion(roomTexts.length > 0 ? roomTexts : allTexts, channelTitle(channel), [
+          channel.name || "",
+          channel.display_name || "",
+          channel.purpose || "",
+          channel.header || ""
+        ]);
+
+        const baseCombined = effectiveScopeScore * 1.05 + channelScore * 2.2 + (effectiveScopeScore >= 60 && channelScore >= 60 ? 30 : 0);
+        const lastScopeMatch = isLastSelectedScope(scope);
+        const channelNameMatchesButTeamIsUnclear = channelScore >= 45 && effectiveScopeScore < 60;
+        const lastSelectedChannelMatch = state.config.lastSelectedChannelId && state.config.lastSelectedChannelId === channel.id;
+
+        let lastSelectedTeamBonus = 0;
+
+        if (lastScopeMatch && channelScore >= 45) {
+          /*
+           * This is intentionally strongest when the channel name matches but
+           * the current Matrix space/room context does not clearly identify a
+           * Mattermost team. Example: town-square, _townsquare, Town Square.
+           */
+          lastSelectedTeamBonus += channelNameMatchesButTeamIsUnclear ? 90 : 35;
+        }
+
+        if (lastScopeMatch && lastSelectedChannelMatch) {
+          lastSelectedTeamBonus += 15;
+        }
+
+        const combined = baseCombined + lastSelectedTeamBonus;
+
+        if (!best || combined > best.score) {
+          best = {
+            scope,
+            channel,
+            score: combined,
+            baseScore: baseCombined,
+            scopeScore: effectiveScopeScore,
+            channelScore,
+            usedLastSelectedTeam: lastSelectedTeamBonus > 0,
+            quality: combined >= 210 ? "strong" : combined >= 110 ? "fuzzy" : "weak"
+          };
+        }
+      }
+    }
+
+    /*
+     * Threshold deliberately allows punctuation-only and small spelling
+     * differences, but avoids selecting completely unrelated channels when no
+     * Matrix context text is available.
+     */
+    if (best && best.score >= 45) {
+      state.selectedScope = best.scope;
+      state.selectedChannel = best.channel;
+      state.lastSuggestion = best;
+      return best;
+    }
+
+    if (!state.selectedScope) {
+      state.selectedScope = state.scopes[0] || null;
+    }
+
+    state.lastSuggestion = null;
+    return null;
+  }
+
+  function applyContextSuggestion(root, reason = "current Matrix context") {
+    if (!state.loaded) {
+      return null;
+    }
+
+    const suggestion = suggestTeamAndChannelFromCurrentMatrixContext();
+    const status = qs("#mmi-status", root);
+
+    if (status) {
+      if (suggestion) {
+        status.textContent = `${suggestionDescription(suggestion)} from ${reason}.`;
+      } else {
+        status.textContent = `No confident Mattermost team/channel guess from ${reason}. Select manually.`;
+      }
+    }
+
+    return suggestion;
+  }
+
+  function applyPendingContextSuggestionIfOpen() {
+    const overlay = document.getElementById(OVERLAY_ID);
+
+    if (!overlay || !state.loaded || !state.pendingContextSuggestion || state.manualSelectionAfterOpen) {
+      return;
+    }
+
+    const suggestion = applyContextSuggestion(overlay, "updated Matrix room/space values");
+
+    if (suggestion) {
+      appendLog(overlay, suggestionDescription(suggestion));
+    }
+
+    state.pendingContextSuggestion = false;
+    renderLoadedUi(overlay);
+  }
+
   async function loadPostsForChannel(channel) {
     if (state.postsCache.has(channel.id)) {
       return state.postsCache.get(channel.id);
@@ -640,7 +1179,7 @@
 
   function makeTextItem(channel, post, options = {}) {
     const prefix = originalMessagePrefix(post);
-    const message = String(post.message || "").trim();
+    const message = convertCommonEmojiShortcodes(String(post.message || "").trim());
     const body = message ? `${prefix}\n${message}` : `${prefix}\n${options.fallbackText || "[attachment message]"}`;
 
     const formattedPrefix = `<strong>${escapeHtml(userName(post.user_id))}</strong> <span data-mx-color="#687076">· ${escapeHtml(formatMattermostTime(post.create_at))}</span>`;
@@ -804,6 +1343,48 @@
     });
   }
 
+  function updateImportProgress(root, importedPosts, totalPosts, importedImages, totalImages, text = "") {
+    /*
+     * The progress bar is message-based because Matrix sending is sequential
+     * per Mattermost post. Image counts are shown as additional context.
+     */
+    const fill = qs("#mmi-progress-fill", root);
+    const label = qs("#mmi-progress-text", root);
+    const status = qs("#mmi-status", root);
+
+    const safeTotal = Math.max(1, totalPosts || 0);
+    const percent = Math.max(0, Math.min(100, Math.round((importedPosts / safeTotal) * 100)));
+
+    if (fill) {
+      fill.style.width = `${percent}%`;
+      fill.setAttribute("aria-valuenow", String(percent));
+    }
+
+    if (label) {
+      label.textContent = `${percent}% · ${importedPosts}/${totalPosts} messages · ${importedImages}/${totalImages} images`;
+    }
+
+    if (status && text) {
+      status.textContent = text;
+    }
+  }
+
+  function setImportControls(root, importing) {
+    /*
+     * Disable operations that could change the selected channel while an import
+     * is running. Cancelling stops after the currently active Matrix send call.
+     */
+    const selectButton = qs("#mmi-select-folder", root);
+    const importButton = qs("#mmi-import", root);
+    const cancelButton = qs("#mmi-cancel", root);
+    const otherFiles = qs("#mmi-other-files", root);
+
+    if (selectButton) selectButton.disabled = importing;
+    if (importButton) importButton.disabled = importing || !state.loaded || !state.selectedChannel;
+    if (cancelButton) cancelButton.disabled = !importing;
+    if (otherFiles) otherFiles.disabled = importing;
+  }
+
   async function importSelectedChannel(root) {
     if (state.importing) return;
     if (!state.selectedChannel) throw new Error("No Mattermost channel selected.");
@@ -812,6 +1393,9 @@
     if (!room) throw new Error("Could not detect the current Matrix room from the URL.");
 
     state.importing = true;
+    state.cancelRequested = false;
+    setImportControls(root, true);
+    updateImportProgress(root, 0, 1, 0, 0, "Preparing import…");
 
     try {
       const includeOtherFiles = qs("#mmi-other-files", root).checked;
@@ -819,8 +1403,11 @@
       await saveConfig();
 
       const channel = state.selectedChannel;
+      rememberSelection(state.selectedScope, channel);
       const posts = await loadPostsForChannel(channel);
       const stats = await countImportStats(posts);
+
+      updateImportProgress(root, 0, stats.messages, 0, stats.images, "Ready to import.");
 
       const confirmed = window.confirm(
         `Really import ${stats.messages} messages and ${stats.images} images into the current Matrix room?\n\n` +
@@ -830,7 +1417,8 @@
       );
 
       if (!confirmed) {
-        appendLog(root, "Import cancelled.");
+        appendLog(root, "Import cancelled before sending.");
+        updateImportProgress(root, 0, stats.messages, 0, stats.images, "Cancelled.");
         return;
       }
 
@@ -858,12 +1446,28 @@
       let importedPosts = 0;
       let importedImages = 0;
       let importedFiles = 0;
+      let cancelled = false;
+
+      updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Importing…");
 
       for (const post of posts) {
+        if (state.cancelRequested) {
+          cancelled = true;
+          appendLog(root, "Cancel requested. Stopping before next post.");
+          break;
+        }
+
         const items = await buildItemsForPost(channel, post, includeOtherFiles);
+
+        if (state.cancelRequested) {
+          cancelled = true;
+          appendLog(root, "Cancel requested. Stopping before next send.");
+          break;
+        }
 
         if (items.length === 0) {
           importedPosts += 1;
+          updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Importing…");
           continue;
         }
 
@@ -873,20 +1477,32 @@
         importedImages += imageFileInfos(post).length;
         importedFiles += includeOtherFiles ? otherFileInfos(post).length : 0;
 
-        qs("#mmi-status", root).textContent = `Imported ${importedPosts}/${stats.messages} messages, ${importedImages}/${stats.images} images.`;
+        updateImportProgress(
+          root,
+          importedPosts,
+          stats.messages,
+          importedImages,
+          stats.images,
+          `Imported ${importedPosts}/${stats.messages} messages, ${importedImages}/${stats.images} images.`
+        );
         appendLog(root, `Imported post ${importedPosts}/${stats.messages}: ${post.id}`);
 
         await sleep(100);
       }
 
+      const finalType = cancelled || state.cancelRequested ? "import-cancelled" : "import-finished";
+      const finalText = cancelled || state.cancelRequested
+        ? `Mattermost import cancelled: ${channelTitle(channel)} (${importedPosts}/${stats.messages} messages, ${importedImages}/${stats.images} images).`
+        : `Mattermost import finished: ${channelTitle(channel)} (${importedPosts} messages, ${importedImages} images, ${importedFiles} files).`;
+
       const finishItem = {
         kind: "text",
         msgtype: "m.notice",
-        body: `Mattermost import finished: ${channelTitle(channel)} (${importedPosts} messages, ${importedImages} images, ${importedFiles} files).`,
-        shortLabel: "import-finished",
+        body: finalText,
+        shortLabel: finalType,
         meta: {
           source: "mattermost-static-local-export",
-          type: "import-finished",
+          type: finalType,
           channel_id: channel.id,
           channel_name: channelTitle(channel),
           message_count: importedPosts,
@@ -897,10 +1513,17 @@
 
       await sendItemsViaPageBridge(room, [finishItem], text => appendLog(root, text));
 
-      qs("#mmi-status", root).textContent = "Done.";
-      appendLog(root, "Import finished.");
+      if (cancelled || state.cancelRequested) {
+        updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Cancelled.");
+        appendLog(root, "Import cancelled.");
+      } else {
+        updateImportProgress(root, importedPosts, stats.messages, importedImages, stats.images, "Done.");
+        appendLog(root, "Import finished.");
+      }
     } finally {
       state.importing = false;
+      state.cancelRequested = false;
+      setImportControls(root, false);
     }
   }
 
@@ -1018,10 +1641,7 @@
     renderScopes(root);
     renderChannels(root);
 
-    const importButton = qs("#mmi-import", root);
-    if (importButton) {
-      importButton.disabled = !state.loaded || !state.selectedChannel;
-    }
+    setImportControls(root, state.importing);
 
     renderPreview(root).catch(error => appendLog(root, `Preview error: ${error.message || error}`));
   }
@@ -1034,6 +1654,8 @@
       return;
     }
 
+    state.pendingContextSuggestion = true;
+    state.manualSelectionAfterOpen = false;
     requestPageSession();
 
     const overlay = document.createElement("div");
@@ -1049,13 +1671,14 @@
             <div class="mmi-small" id="mmi-session">Waiting for live Element MatrixClient…</div>
             <div class="mmi-warning">Lazy local mode: first only manifest.json and users.json are read. Channel post chunks and assets are opened only after you select/import one channel.</div>
           </div>
-          <button class="mmi-close" id="mmi-close" title="Close">×</button>
+          <button class="mmi-close" id="mmi-close" title="Close" aria-label="Close">×</button>
         </div>
 
         <div class="mmi-controls">
           <button id="mmi-select-folder">Select export folder metadata</button>
-          <button id="mmi-import" ${state.loaded ? "" : "disabled"}>Import selected channel</button>
           <label><input id="mmi-other-files" type="checkbox" ${state.config.includeOtherFiles ? "checked" : ""}> Import non-image files if present</label>
+          <label><input id="mmi-remember-folder" type="checkbox" ${state.config.rememberExportFolder ? "checked" : ""}> Reuse this export folder next time</label>
+          <div class="mmi-small" id="mmi-folder-hint">${state.config.lastExportFolderName ? "Last export folder: " + escapeHtml(state.config.lastExportFolderName) : "No export folder remembered yet."}</div>
         </div>
 
         <div class="mmi-body">
@@ -1078,8 +1701,17 @@
         </div>
 
         <div class="mmi-footer">
-          <div class="mmi-progress" id="mmi-status">Ready.</div>
-          <button class="mmi-secondary-button" id="mmi-close-footer">Close</button>
+          <div class="mmi-footer-progress">
+            <div class="mmi-progress" id="mmi-status">Ready.</div>
+            <div class="mmi-progressbar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div class="mmi-progressbar-fill" id="mmi-progress-fill"></div>
+            </div>
+            <div class="mmi-progress-text" id="mmi-progress-text">0% · 0/0 messages · 0/0 images</div>
+          </div>
+          <div class="mmi-footer-actions">
+            <button class="mmi-cancel-button" id="mmi-cancel" disabled>Cancel upload</button>
+            <button class="mmi-primary-button" id="mmi-import" ${state.loaded && state.selectedChannel ? "" : "disabled"}>Import selected channel</button>
+          </div>
         </div>
       </div>
     `;
@@ -1088,19 +1720,28 @@
     updateSessionUiIfOpen();
 
     qs("#mmi-close", overlay).addEventListener("click", () => overlay.remove());
-    qs("#mmi-close-footer", overlay).addEventListener("click", () => overlay.remove());
+
+    qs("#mmi-remember-folder", overlay).addEventListener("change", async event => {
+      state.config.rememberExportFolder = Boolean(event.target.checked);
+      await saveConfig();
+    });
 
     qs("#mmi-select-folder", overlay).addEventListener("click", async () => {
       try {
         qs("#mmi-status", overlay).textContent = "Opening local export folder…";
 
+        state.config.rememberExportFolder = qs("#mmi-remember-folder", overlay).checked;
+        await saveConfig();
+
         await selectExportFolderLazily();
         await loadExportFromSelectedFolder();
+        const suggestion = applyContextSuggestion(overlay, "current Matrix room/space values");
 
-        qs("#mmi-import", overlay).disabled = true;
-        qs("#mmi-status", overlay).textContent = `Loaded metadata from ${state.rootName}. Select one channel to preview/import.`;
+        qs("#mmi-import", overlay).disabled = !state.selectedChannel;
+        qs("#mmi-folder-hint", overlay).textContent = `Current export folder: ${state.rootName}`;
         appendLog(overlay, `Loaded metadata only: ${state.rootName}`);
-        appendLog(overlay, "No post chunks or assets have been read yet.");
+        if (suggestion) appendLog(overlay, suggestionDescription(suggestion));
+        appendLog(overlay, "No post chunks or assets have been read until preview/import.");
         renderLoadedUi(overlay);
       } catch (error) {
         qs("#mmi-status", overlay).textContent = "Error.";
@@ -1118,6 +1759,13 @@
       }
     });
 
+    qs("#mmi-cancel", overlay).addEventListener("click", () => {
+      if (!state.importing) return;
+      state.cancelRequested = true;
+      qs("#mmi-status", overlay).textContent = "Cancelling after the current Matrix send finishes…";
+      appendLog(overlay, "Cancel requested by user.");
+    });
+
     overlay.addEventListener("click", event => {
       const scopeButton = event.target.closest("[data-scope-type][data-scope-id]");
       const channelButton = event.target.closest("[data-channel-id]");
@@ -1126,18 +1774,45 @@
         const type = scopeButton.getAttribute("data-scope-type");
         const id = scopeButton.getAttribute("data-scope-id");
 
+        state.manualSelectionAfterOpen = true;
+        state.pendingContextSuggestion = false;
         state.selectedScope = state.scopes.find(scope => scope.type === type && scope.id === id) || null;
         state.selectedChannel = null;
+        rememberSelection(state.selectedScope, null);
         renderLoadedUi(overlay);
       }
 
       if (channelButton) {
         const channelId = channelButton.getAttribute("data-channel-id");
+        state.manualSelectionAfterOpen = true;
+        state.pendingContextSuggestion = false;
         state.selectedChannel = allChannels().find(channel => channel.id === channelId) || null;
+        rememberSelection(state.selectedScope, state.selectedChannel);
         renderLoadedUi(overlay);
       }
     });
 
+    if (state.loaded) {
+      const suggestion = applyContextSuggestion(overlay, "current Matrix room/space values");
+      if (suggestion) appendLog(overlay, suggestionDescription(suggestion));
+    }
+
     renderLoadedUi(overlay);
+
+    if (!state.loaded && state.config.rememberExportFolder) {
+      useRememberedExportFolderIfAvailable()
+        .then(loaded => {
+          if (!loaded) return;
+
+          const suggestion = applyContextSuggestion(overlay, "current Matrix room/space values");
+          qs("#mmi-folder-hint", overlay).textContent = `Current export folder: ${state.rootName}`;
+          appendLog(overlay, `Reused stored export folder: ${state.rootName}`);
+          if (suggestion) appendLog(overlay, suggestionDescription(suggestion));
+          renderLoadedUi(overlay);
+        })
+        .catch(error => {
+          appendLog(overlay, `Could not reuse stored export folder: ${error.message || error}`);
+        });
+    }
   }
 })();
