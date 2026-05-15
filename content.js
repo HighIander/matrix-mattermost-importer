@@ -74,6 +74,10 @@
       label: "0% - 0/0 messages - 0/0 images",
       text: "Ready."
     },
+    importLogLines: [],
+    floatingLogVisible: false,
+    floatingLogHasAttention: false,
+    floatingLogHideTimer: null,
     pendingContextSuggestion: false,
     manualSelectionAfterOpen: false,
     lastSuggestion: null
@@ -559,7 +563,11 @@
     button.id = BUTTON_ID;
     button.className = "mmi-button";
     button.type = "button";
-    button.innerHTML = MAIN_BUTTON_ICON;
+    button.innerHTML = `
+      ${MAIN_BUTTON_ICON}
+      <span class="mmi-button-attention" aria-hidden="true">&#9888;</span>
+      <span class="mmi-button-log-popover" role="tooltip"></span>
+    `;
     button.title = "Import Mattermost export";
     button.setAttribute("aria-label", "Import Mattermost export");
 
@@ -574,6 +582,8 @@
     let startBottom = 0;
 
     button.addEventListener("pointerdown", event => {
+      if (event.target.closest(".mmi-button-log-popover")) return;
+
       dragging = true;
       moved = false;
       startX = event.clientX;
@@ -593,6 +603,7 @@
 
       button.style.right = `${Math.max(4, startRight - dx)}px`;
       button.style.bottom = `${Math.max(4, startBottom - dy)}px`;
+      positionFloatingLogPopover(button);
     });
 
     button.addEventListener("pointerup", async event => {
@@ -604,6 +615,7 @@
       state.config.buttonRight = parseFloat(button.style.right) || DEFAULT_CONFIG.buttonRight;
       state.config.buttonBottom = parseFloat(button.style.bottom) || DEFAULT_CONFIG.buttonBottom;
       await saveConfig();
+      positionFloatingLogPopover(button);
 
       if (!moved) {
         openModal();
@@ -617,9 +629,111 @@
 
       button.style.right = `${right}px`;
       button.style.bottom = `${bottom}px`;
+      positionFloatingLogPopover(button);
     });
 
+    button.addEventListener("mouseenter", () => showFloatingLogPopover(button));
+    button.addEventListener("mouseleave", scheduleFloatingLogPopoverHide);
+    button.addEventListener("focusin", () => showFloatingLogPopover(button));
+    button.addEventListener("focusout", scheduleFloatingLogPopoverHide);
+
     document.body.appendChild(button);
+    updateFloatingLogUi();
+  }
+
+  function positionFloatingLogPopover(button = document.getElementById(BUTTON_ID)) {
+    if (!button) return;
+
+    const rect = button.getBoundingClientRect();
+    const useRightSide = rect.left < window.innerWidth / 2;
+    const useBelow = rect.top < window.innerHeight / 2;
+
+    button.classList.toggle("mmi-button--popover-right", useRightSide);
+    button.classList.toggle("mmi-button--popover-left", !useRightSide);
+    button.classList.toggle("mmi-button--popover-below", useBelow);
+    button.classList.toggle("mmi-button--popover-above", !useBelow);
+  }
+
+  function scrollFloatingLogPopoverToBottom(button = document.getElementById(BUTTON_ID)) {
+    const popover = button ? qs(".mmi-button-log-popover", button) : null;
+    if (!popover) return;
+
+    requestAnimationFrame(() => {
+      popover.scrollTop = popover.scrollHeight;
+    });
+  }
+
+  function clearFloatingLogPopoverHideTimer() {
+    if (!state.floatingLogHideTimer) return;
+
+    clearTimeout(state.floatingLogHideTimer);
+    state.floatingLogHideTimer = null;
+  }
+
+  function showFloatingLogPopover(button = document.getElementById(BUTTON_ID)) {
+    if (!button || !button.classList.contains("mmi-button--has-log")) return;
+
+    clearFloatingLogPopoverHideTimer();
+    button.classList.add("mmi-button--log-open");
+    scrollFloatingLogPopoverToBottom(button);
+  }
+
+  function hideFloatingLogPopover() {
+    const button = document.getElementById(BUTTON_ID);
+    if (button) button.classList.remove("mmi-button--log-open");
+    state.floatingLogHideTimer = null;
+  }
+
+  function scheduleFloatingLogPopoverHide() {
+    clearFloatingLogPopoverHideTimer();
+    state.floatingLogHideTimer = setTimeout(hideFloatingLogPopover, 1000);
+  }
+
+  function updateFloatingLogUi() {
+    const button = document.getElementById(BUTTON_ID);
+    if (!button) return;
+
+    const logText = state.importLogLines.join("\n");
+    const hasLog = state.floatingLogVisible && Boolean(logText);
+    const popover = qs(".mmi-button-log-popover", button);
+
+    button.classList.toggle("mmi-button--has-log", hasLog);
+    button.classList.toggle("mmi-button--has-attention", hasLog && state.floatingLogHasAttention);
+    button.title = hasLog ? "Import Mattermost export - hover for latest import log" : "Import Mattermost export";
+    button.setAttribute(
+      "aria-label",
+      hasLog ? "Import Mattermost export. Latest import log available." : "Import Mattermost export"
+    );
+
+    if (popover) {
+      popover.textContent = logText;
+    }
+
+    if (!hasLog) {
+      button.classList.remove("mmi-button--log-open");
+      clearFloatingLogPopoverHideTimer();
+    } else if (button.classList.contains("mmi-button--log-open")) {
+      scrollFloatingLogPopoverToBottom(button);
+    }
+
+    positionFloatingLogPopover(button);
+  }
+
+  function resetImportLog(root = null) {
+    state.importLogLines = [];
+    state.floatingLogVisible = false;
+    state.floatingLogHasAttention = false;
+
+    const log = root ? qs("#mmi-log", root) : null;
+    if (log) log.textContent = "";
+
+    updateFloatingLogUi();
+  }
+
+  function publishFloatingImportLog(hasAttention = false) {
+    state.floatingLogVisible = state.importLogLines.length > 0;
+    state.floatingLogHasAttention = state.floatingLogHasAttention || Boolean(hasAttention);
+    updateFloatingLogUi();
   }
 
   function createFolderInput() {
@@ -1646,7 +1760,10 @@
         if (settled) return;
         settled = true;
         cleanup();
-        reject(new Error("Live Element MatrixClient request timed out"));
+        const error = new Error(`Live Element MatrixClient request timed out after ${formatDuration(timeoutMs)}. A large upload or slow homeserver response may still be running in the Element page.`);
+        error.name = "MattermostImporterTimeoutError";
+        error.timeoutMs = timeoutMs;
+        reject(error);
       };
 
       const armTimeout = () => {
@@ -1699,7 +1816,7 @@
       requestIdPrefix: "mmi_duplicate",
       room,
       duplicateCheck,
-      timeoutMs: 180000
+      timeoutMs: PAGE_BRIDGE_DEFAULT_TIMEOUT_MS
     }, log);
   }
 
@@ -1961,6 +2078,7 @@
     const room = detectCurrentRoomIdOrAlias();
     if (!room) throw new Error("Could not detect the current Matrix room from the URL.");
 
+    resetImportLog(root);
     state.importing = true;
     state.cancelRequested = false;
     setImportControls(root, true);
@@ -1997,6 +2115,7 @@
       if (!confirmed) {
         appendLog(root, "Import cancelled before sending.");
         updateImportProgress(root, 0, stats.messages, 0, stats.images, "Cancelled.");
+        publishFloatingImportLog(false);
         return;
       }
 
@@ -2035,6 +2154,7 @@
       let skippedPosts = 0;
       let skippedImages = 0;
       let skippedFiles = 0;
+      let uploadErrorFiles = 0;
       let cancelled = false;
       const postEventIds = new Map();
       const threadLatestEventIds = new Map();
@@ -2098,8 +2218,42 @@
           continue;
         }
 
-        const sendResult = await sendItemsViaPageBridge(room, items, text => appendLog(root, text), duplicateCheck, threadContext);
+        let sendResult = null;
+
+        try {
+          sendResult = await sendItemsViaPageBridge(room, items, text => appendLog(root, text), duplicateCheck, threadContext);
+        } catch (error) {
+          const skippedItemCounts = fileItemCounts(items);
+          processedPosts += 1;
+          processedImages += postImages;
+          skippedPosts += 1;
+          skippedImages += skippedItemCounts.images;
+          skippedFiles += skippedItemCounts.otherFiles;
+          uploadErrorFiles += skippedItemCounts.total;
+
+          appendLog(root, `Error: skipped post ${processedPosts}/${stats.messages} after Matrix send failed: ${post.id}`);
+          if (skippedItemCounts.total > 0) {
+            appendLog(root, `Files in skipped post: ${fileItemSummary(items)}.`);
+          }
+          appendLog(root, `Reason: ${errorText(error)} The import will continue with the next post. Check the Matrix room before retrying; browser uploads or sends can still finish late in Element.`);
+          publishFloatingImportLog(true);
+
+          updateImportProgress(
+            root,
+            processedPosts,
+            stats.messages,
+            processedImages,
+            stats.images,
+            `Checked ${processedPosts}/${stats.messages} messages. Imported ${importedPosts}, skipped ${skippedPosts}.`
+          );
+
+          await sleep(100);
+          continue;
+        }
+
         const primaryEventId = primaryEventIdFromSendResult(sendResult);
+        const skippedUploadFiles = Array.isArray(sendResult.skippedFiles) ? sendResult.skippedFiles : [];
+        const skippedUploadCounts = skippedFileCounts(skippedUploadFiles);
 
         if (threadContext?.rootPostId && sendResult.threadRootEventId) {
           postEventIds.set(threadContext.rootPostId, sendResult.threadRootEventId);
@@ -2120,8 +2274,20 @@
           appendLog(root, `Skipped duplicate post ${processedPosts}/${stats.messages}: ${post.id}`);
         } else {
           importedPosts += 1;
-          importedImages += postImages;
-          importedFiles += postFiles;
+          importedImages += Math.max(0, postImages - skippedUploadCounts.images);
+          importedFiles += Math.max(0, postFiles - skippedUploadCounts.otherFiles);
+          skippedImages += skippedUploadCounts.images;
+          skippedFiles += skippedUploadCounts.otherFiles;
+          uploadErrorFiles += skippedUploadFiles.length;
+
+          if (skippedUploadFiles.length > 0) {
+            appendLog(root, `Attention: imported post ${processedPosts}/${stats.messages} but skipped ${skippedUploadFiles.length} file upload(s): ${post.id}`);
+            for (const skippedFile of skippedUploadFiles) {
+              appendLog(root, `Error: skipped file: ${skippedFileLogText(skippedFile)}`);
+            }
+            publishFloatingImportLog(true);
+          }
+
           appendLog(root, `Imported post ${processedPosts}/${stats.messages}: ${post.id}`);
         }
 
@@ -2138,9 +2304,10 @@
       }
 
       const finalType = cancelled || state.cancelRequested ? "import-cancelled" : "import-finished";
+      const uploadErrorText = uploadErrorFiles > 0 ? `, ${uploadErrorFiles} file upload(s) failed/skipped` : "";
       const finalText = cancelled || state.cancelRequested
-        ? `Mattermost import cancelled: ${channelTitle(channel)} (${processedPosts}/${stats.messages} checked, ${importedPosts} imported, ${skippedPosts} skipped).`
-        : `Mattermost import finished: ${channelTitle(channel)} (${importedPosts} imported, ${skippedPosts} skipped, ${importedImages} images, ${importedFiles} files).`;
+        ? `Mattermost import cancelled: ${channelTitle(channel)} (${processedPosts}/${stats.messages} checked, ${importedPosts} imported, ${skippedPosts} skipped${uploadErrorText}).`
+        : `Mattermost import finished: ${channelTitle(channel)} (${importedPosts} imported, ${skippedPosts} skipped, ${importedImages} images, ${importedFiles} files${uploadErrorText}).`;
 
       const finishItem = {
         kind: "text",
@@ -2159,6 +2326,7 @@
           skipped_message_count: skippedPosts,
           skipped_image_count: skippedImages,
           skipped_other_file_count: skippedFiles,
+          skipped_upload_file_count: uploadErrorFiles,
           import_from_date: filterInfo.dateValue || undefined,
           ignored_before_import_from_count: filterInfo.ignoredCount || undefined
         }
@@ -2173,6 +2341,7 @@
         updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Done.");
         appendLog(root, `Import finished. Imported ${importedPosts}, skipped ${skippedPosts}.`);
       }
+      publishFloatingImportLog(uploadErrorFiles > 0);
     } finally {
       state.importing = false;
       state.cancelRequested = false;
@@ -2187,6 +2356,88 @@
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function formatDuration(ms) {
+    const seconds = Math.ceil(Number(ms || 0) / 1000);
+
+    if (seconds < 60) {
+      return `${seconds}s`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+
+    return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+
+  function formatFileSize(bytes) {
+    const value = Number(bytes || 0);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      return "unknown size";
+    }
+
+    const units = ["B", "KB", "MB", "GB"];
+    let size = value;
+    let unitIndex = 0;
+
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+
+    return `${size >= 10 || unitIndex === 0 ? Math.round(size) : size.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  function errorText(error) {
+    return error?.message || error?.data?.error || error?.response?.data?.error || String(error);
+  }
+
+  function fileItemSummary(items) {
+    const fileItems = (items || []).filter(item => item?.kind === "file");
+    const names = fileItems
+      .slice(0, 4)
+      .map(item => item.fileMeta?.name || item.file?.name || "file");
+    const suffix = fileItems.length > names.length ? ` and ${fileItems.length - names.length} more` : "";
+
+    return fileItems.length ? `${fileItems.length} file(s): ${names.join(", ")}${suffix}` : "no files";
+  }
+
+  function fileItemCounts(items) {
+    const fileItems = (items || []).filter(item => item?.kind === "file");
+    const images = fileItems.filter(item => String(item.fileMeta?.type || item.file?.type || "").startsWith("image/")).length;
+
+    return {
+      total: fileItems.length,
+      images,
+      otherFiles: fileItems.length - images
+    };
+  }
+
+  function skippedFileReasonLabel(reason) {
+    if (reason === "too_large") return "file is too large for the Matrix homeserver";
+    if (reason === "timeout") return "upload took too long";
+    return "upload failed";
+  }
+
+  function skippedFileLogText(file) {
+    const name = file?.name || "file";
+    const size = formatFileSize(file?.size);
+    const reason = skippedFileReasonLabel(file?.reason);
+    const details = file?.message ? ` Details: ${file.message}` : "";
+
+    return `${name} (${size}) - ${reason}.${details}`;
+  }
+
+  function skippedFileCounts(files) {
+    const skippedFiles = Array.isArray(files) ? files : [];
+    const images = skippedFiles.filter(file => file?.isImage).length;
+
+    return {
+      images,
+      otherFiles: skippedFiles.length - images
+    };
   }
 
   function updateSessionUiIfOpen() {
@@ -2207,12 +2458,19 @@
   }
 
   function appendLog(root, text) {
-    const log = qs("#mmi-log", root);
-    if (!log) return;
-
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
-    log.textContent = log.textContent ? `${log.textContent}\n${line}` : line;
-    log.scrollTop = log.scrollHeight;
+    state.importLogLines.push(line);
+
+    const log = root ? qs("#mmi-log", root) : null;
+
+    if (log) {
+      log.textContent = state.importLogLines.join("\n");
+      log.scrollTop = log.scrollHeight;
+    }
+
+    if (state.floatingLogVisible) {
+      updateFloatingLogUi();
+    }
   }
 
   function renderScopes(root) {
@@ -2389,6 +2647,11 @@
     `;
 
     document.body.appendChild(overlay);
+    const existingLog = qs("#mmi-log", overlay);
+    if (existingLog && state.importLogLines.length > 0) {
+      existingLog.textContent = state.importLogLines.join("\n");
+      existingLog.scrollTop = existingLog.scrollHeight;
+    }
     updateSessionUiIfOpen();
 
     qs("#mmi-close", overlay).addEventListener("click", () => closeFullDialog());
@@ -2430,6 +2693,7 @@
       } catch (error) {
         qs("#mmi-status", overlay).textContent = "Error.";
         appendLog(overlay, `Import error: ${error.message || error}`);
+        publishFloatingImportLog(true);
       }
     });
 

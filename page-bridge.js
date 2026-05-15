@@ -16,6 +16,10 @@
   const RATE_LIMIT_RETRY_DEFAULT_MS = 5000;
   const RATE_LIMIT_RETRY_MAX_MS = 300000;
   const RATE_LIMIT_RETRY_HEARTBEAT_MS = 30000;
+  const UPLOAD_TIMEOUT_MS = 600000;
+  const UPLOAD_PROGRESS_HEARTBEAT_MS = 30000;
+  const UPLOAD_RETRY_COUNT = 5;
+  const SEND_RETRY_COUNT = 5;
 
   let lastSession = null;
   let installed = false;
@@ -391,6 +395,71 @@
     return error?.message || error?.data?.error || error?.response?.data?.error || String(error);
   }
 
+  function formatFileSize(bytes) {
+    const value = Number(bytes || 0);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      return "unknown size";
+    }
+
+    const units = ["B", "KB", "MB", "GB"];
+    let size = value;
+    let unitIndex = 0;
+
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+
+    return `${size >= 10 || unitIndex === 0 ? Math.round(size) : size.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  function operationTimeoutError(description, timeoutMs) {
+    const error = new Error(`${description} timed out after ${formatDelay(timeoutMs)}`);
+    error.name = "MattermostImporterTimeoutError";
+    error.timeoutMs = timeoutMs;
+    return error;
+  }
+
+  function withOperationTimeout(description, requestId, timeoutMs, operation) {
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      let settled = false;
+      let timeout = null;
+      let heartbeat = null;
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        clearInterval(heartbeat);
+      };
+
+      const settle = (handler, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        handler(value);
+      };
+
+      timeout = setTimeout(() => {
+        settle(reject, operationTimeoutError(description, timeoutMs));
+      }, timeoutMs);
+
+      heartbeat = setInterval(() => {
+        const remaining = timeoutMs - (Date.now() - startedAt);
+        if (remaining > 0) {
+          postProgress(requestId, `Still ${description}; timeout in ${formatDelay(remaining)}.`);
+        }
+      }, UPLOAD_PROGRESS_HEARTBEAT_MS);
+
+      Promise.resolve()
+        .then(operation)
+        .then(
+          value => settle(resolve, value),
+          error => settle(reject, error)
+        );
+    });
+  }
+
   function headerValue(headers, name) {
     if (!headers) return "";
 
@@ -477,6 +546,49 @@
       message.includes("rate limit") ||
       message.includes("rate-limited") ||
       message.includes("ratelimited");
+  }
+
+  function errorCodes(error) {
+    return [
+      error?.errcode,
+      error?.name,
+      error?.data?.errcode,
+      error?.response?.data?.errcode
+    ].map(value => String(value || "").toUpperCase());
+  }
+
+  function isTooLargeUploadError(error) {
+    const message = errorMessage(error).toLowerCase();
+
+    return statusCode(error) === 413 ||
+      errorCodes(error).includes("M_TOO_LARGE") ||
+      message.includes("too large") ||
+      message.includes("payload too large") ||
+      message.includes("request entity too large") ||
+      message.includes("max file size") ||
+      message.includes("m_too_large") ||
+      message.includes("413");
+  }
+
+  function isTimeoutUploadError(error) {
+    const message = errorMessage(error).toLowerCase();
+    const name = String(error?.name || "").toLowerCase();
+
+    return name.includes("timeout") ||
+      message.includes("timed out") ||
+      message.includes("timeout");
+  }
+
+  function uploadFailureReason(error) {
+    if (isTooLargeUploadError(error)) return "too_large";
+    if (isTimeoutUploadError(error)) return "timeout";
+    return "upload_error";
+  }
+
+  function uploadFailureLabel(reason) {
+    if (reason === "too_large") return "file is too large for the Matrix homeserver";
+    if (reason === "timeout") return "upload took too long";
+    return "upload failed";
   }
 
   function retryDelayMs(error, attempt) {
@@ -673,28 +785,65 @@
     }
   }
 
-  function shouldUseThreadAwareSend(client, thread) {
-    return Boolean(
-      thread?.rootEventId &&
-      String(thread.rootEventId).startsWith("$") &&
-      client &&
-      typeof client.sendMessage === "function"
-    );
+  function makeTxnId(client) {
+    try {
+      const sdkTxnId = client?.makeTxnId?.();
+      if (sdkTxnId) return String(sdkTxnId);
+    } catch {}
+
+    return `mmi_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
 
-  async function sendMessageToRoom(client, roomId, content, thread) {
-    if (shouldUseThreadAwareSend(client, thread)) {
-      /*
-       * Current matrix-js-sdk versions have a thread-aware overload:
-       * sendMessage(roomId, threadId, content). Using it lets Element update
-       * its local thread model immediately instead of treating the local echo
-       * like a plain timeline message until the user opens the thread. The SDK
-       * adds the Matrix m.thread relation when it is missing.
-       */
-      return client.sendMessage(roomId, thread.rootEventId, cloneMessageContent(content));
+  async function sendRoomMessageViaHttp(client, roomId, content, txnId) {
+    const http = client?.http || client?._http;
+
+    if (!http || typeof http.authedRequest !== "function") {
+      throw new Error("MatrixClient has no usable authenticated request method for sending messages");
     }
 
-    return client.sendMessage(roomId, addThreadRelation(cloneMessageContent(content), thread));
+    const path = `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`;
+
+    return http.authedRequest(undefined, "PUT", path, undefined, content);
+  }
+
+  async function sendMessageToRoom(client, roomId, content, thread, txnId = makeTxnId(client)) {
+    const eventContent = addThreadRelation(cloneMessageContent(content), thread);
+
+    if (client?.http || client?._http) {
+      /*
+       * Bypass Element's local-echo bookkeeping. Some Element/matrix-js-sdk
+       * builds can throw "updatePendingEventStatus called on an event which is
+       * not a local echo" after sendMessage(), which aborts imports even though
+       * the importer only needs the homeserver response.
+       */
+      return sendRoomMessageViaHttp(client, roomId, eventContent, txnId);
+    }
+
+    return client.sendMessage(roomId, eventContent);
+  }
+
+  async function sendMessageToRoomWithRetries(description, client, roomId, content, thread, requestId) {
+    const txnId = makeTxnId(client);
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await sendMessageToRoom(client, roomId, content, thread, txnId);
+      } catch (error) {
+        if (attempt >= SEND_RETRY_COUNT) {
+          throw new Error(`Message send failed after ${SEND_RETRY_COUNT} retries while ${description}: ${errorMessage(error)}`);
+        }
+
+        const retryNumber = attempt + 1;
+        const delay = retryDelayMs(error, retryNumber);
+
+        postProgress(
+          requestId,
+          `Warning: message send failed while ${description}: ${errorMessage(error)} Retrying in ${formatDelay(delay)} (${retryNumber}/${SEND_RETRY_COUNT}).`
+        );
+
+        await sleep(delay);
+      }
+    }
   }
 
   function normalizeDuplicateText(value) {
@@ -1097,9 +1246,77 @@
     }
 
     const eventContent = addMattermostMetadata(addThreadFallbackLabel(content, threadContext), item.meta);
-    const result = await withRateLimitRetry("sending text", requestId, () => sendMessageToRoom(client, roomId, eventContent, threadContext));
+    const result = await sendMessageToRoomWithRetries("sending text", client, roomId, eventContent, threadContext, requestId);
 
     return eventIdFromSendResult(result);
+  }
+
+  function uploadFailureError(error, meta, file) {
+    const name = meta.name || file?.name || "file";
+    const reason = uploadFailureReason(error);
+    const wrapped = new Error(`Upload failed for ${name} after ${UPLOAD_RETRY_COUNT} retries: ${uploadFailureLabel(reason)}. ${errorMessage(error)}`);
+
+    wrapped.name = "MattermostImporterUploadError";
+    wrapped.uploadFailure = true;
+    wrapped.reason = reason;
+    wrapped.retries = UPLOAD_RETRY_COUNT;
+    wrapped.fileMeta = {
+      name,
+      size: meta.size || file?.size || 0,
+      type: meta.type || file?.type || "application/octet-stream"
+    };
+
+    return wrapped;
+  }
+
+  function skippedFileFromError(item, error) {
+    const meta = error?.fileMeta || item?.fileMeta || {};
+    const type = meta.type || item?.file?.type || "application/octet-stream";
+
+    return {
+      name: meta.name || item?.file?.name || "file",
+      size: meta.size || item?.file?.size || 0,
+      type,
+      isImage: String(type || "").startsWith("image/"),
+      reason: error?.reason || "upload_error",
+      retries: error?.retries || UPLOAD_RETRY_COUNT,
+      message: errorMessage(error)
+    };
+  }
+
+  function skippedFileProgressMessage(file) {
+    return `Error: skipped file upload after ${file.retries || UPLOAD_RETRY_COUNT} retries: ${file.name} (${formatFileSize(file.size)}). Reason: ${uploadFailureLabel(file.reason)}. Details: ${file.message}`;
+  }
+
+  async function uploadContentWithRetries(client, file, meta, requestId) {
+    const name = meta.name || file?.name || "file";
+    const description = `uploading ${name}`;
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await withOperationTimeout(
+          description,
+          requestId,
+          UPLOAD_TIMEOUT_MS,
+          () => uploadContentViaClient(client, file, meta)
+        );
+      } catch (error) {
+        if (attempt >= UPLOAD_RETRY_COUNT) {
+          throw error;
+        }
+
+        const retryNumber = attempt + 1;
+        const delay = retryDelayMs(error, retryNumber);
+        const reason = uploadFailureLabel(uploadFailureReason(error));
+
+        postProgress(
+          requestId,
+          `Warning: upload failed for ${name} (${formatFileSize(meta.size || file?.size || 0)}): ${reason}. ${errorMessage(error)} Retrying in ${formatDelay(delay)} (${retryNumber}/${UPLOAD_RETRY_COUNT}).`
+        );
+
+        await sleep(delay);
+      }
+    }
   }
 
   async function sendFileItem(client, roomId, item, requestId, threadContext) {
@@ -1108,11 +1325,14 @@
 
     postProgress(requestId, `Lade Datei hoch: ${meta.name || file?.name || "file"}`);
 
-    const mxcUrl = await withRateLimitRetry(
-      `uploading ${meta.name || file?.name || "file"}`,
-      requestId,
-      () => uploadContentViaClient(client, file, meta)
-    );
+    let mxcUrl = "";
+
+    try {
+      mxcUrl = await uploadContentWithRetries(client, file, meta, requestId);
+    } catch (error) {
+      throw uploadFailureError(error, meta, file);
+    }
+
     const isImage = String(meta.type || file?.type || "").startsWith("image/");
 
     const content = {
@@ -1141,7 +1361,7 @@
 
     postProgress(requestId, `Sende Datei: ${content.body}`);
     const eventContent = addMattermostMetadata(addThreadFallbackLabel(content, threadContext), item.meta);
-    const result = await withRateLimitRetry(`sending file ${content.body}`, requestId, () => sendMessageToRoom(client, roomId, eventContent, threadContext));
+    const result = await sendMessageToRoomWithRetries(`sending file ${content.body}`, client, roomId, eventContent, threadContext, requestId);
 
     return eventIdFromSendResult(result);
   }
@@ -1178,6 +1398,7 @@
 
     const threadContext = await resolveThreadContext(client, roomId, payload.thread, requestId);
     const eventIds = [];
+    const skippedFiles = [];
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
@@ -1187,7 +1408,18 @@
       if (item.kind === "text") {
         eventId = await sendTextItem(client, roomId, item, requestId, threadContext);
       } else if (item.kind === "file") {
-        eventId = await sendFileItem(client, roomId, item, requestId, threadContext);
+        try {
+          eventId = await sendFileItem(client, roomId, item, requestId, threadContext);
+        } catch (error) {
+          if (!error?.uploadFailure) {
+            throw error;
+          }
+
+          const skippedFile = skippedFileFromError(item, error);
+          skippedFiles.push(skippedFile);
+          postProgress(requestId, skippedFileProgressMessage(skippedFile));
+          continue;
+        }
       } else {
         throw new Error(`Unknown import item kind: ${item.kind}`);
       }
@@ -1195,17 +1427,19 @@
       if (eventId) eventIds.push(eventId);
     }
 
-    if (duplicateCheck) {
+    if (duplicateCheck && eventIds[0]) {
       rememberDuplicateCheck(roomId, duplicateCheck, eventIds[0] || "");
     }
 
     return {
       ok: true,
       roomId,
-      sent: items.length,
+      sent: eventIds.length,
+      attempted: items.length,
       duplicate: false,
       primaryEventId: eventIds[0] || "",
       eventIds,
+      skippedFiles,
       threadRootEventId: threadContext?.rootEventId || ""
     };
   }
