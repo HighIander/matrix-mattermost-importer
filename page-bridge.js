@@ -20,7 +20,6 @@
   const UPLOAD_PROGRESS_HEARTBEAT_MS = 30000;
   const UPLOAD_RETRY_COUNT = 5;
   const SEND_RETRY_COUNT = 5;
-  const THREAD_PREVIEW_LINE_BREAK_MARKER = "\u2063";
 
   let lastSession = null;
   let installed = false;
@@ -739,26 +738,28 @@
     return content;
   }
 
-  function boldPlainTextCharacter(character) {
-    const codePoint = character.codePointAt(0);
-
-    if (codePoint >= 65 && codePoint <= 90) {
-      return String.fromCodePoint(0x1d400 + codePoint - 65);
-    }
-
-    if (codePoint >= 97 && codePoint <= 122) {
-      return String.fromCodePoint(0x1d41a + codePoint - 97);
-    }
-
-    if (codePoint >= 48 && codePoint <= 57) {
-      return String.fromCodePoint(0x1d7ce + codePoint - 48);
-    }
-
-    return character;
+  function escapeMarkdownBoldText(value) {
+    return String(value || "")
+      .replaceAll("\\", "\\\\")
+      .replaceAll("*", "\\*");
   }
 
-  function boldPlainTextForThreadPreview(value) {
-    return Array.from(String(value || ""), boldPlainTextCharacter).join("");
+  function addThreadFormattedBodySeparator(content, fallbackPrefix, fallbackMessage) {
+    if (!content || typeof content !== "object") {
+      return;
+    }
+
+    content.format = "org.matrix.custom.html";
+
+    const formattedBody = String(content.formatted_body || "");
+    const match = formattedBody.match(/^<div>([\s\S]*?)<\/div><div>([\s\S]*?)<\/div>([\s\S]*)$/);
+
+    if (match) {
+      content.formatted_body = `${match[1]} ·<br>${match[2]}${match[3] || ""}`;
+      return;
+    }
+
+    content.formatted_body = `${escapeHtml(fallbackPrefix)} ·<br>${escapeHtml(fallbackMessage)}`;
   }
 
   function addThreadMainTimelinePreviewFallback(content, thread) {
@@ -787,15 +788,16 @@
     /*
      * Element's main timeline thread summary renders later replies from body
      * text instead of formatted_body. Keep formatted_body rich for the side
-     * panel, and make the plain fallback visually match it as closely as text
-     * allows. The marker is turned into a real <br> by the content script
-     * after Element flattens the preview text.
+     * panel, and use Markdown in the body fallback for the main timeline
+     * preview: bold author, sent time, separator, and a hard line break.
      */
     if (match) {
-      content.body = `${boldPlainTextForThreadPreview(match[1])} · ${match[2]}${THREAD_PREVIEW_LINE_BREAK_MARKER}\n${message}`;
+      content.body = `**${escapeMarkdownBoldText(match[1])}** · ${match[2]} ·  \n${message}`;
     } else {
-      content.body = `${boldPlainTextForThreadPreview(prefix)}${THREAD_PREVIEW_LINE_BREAK_MARKER}\n${message}`;
+      content.body = `**${escapeMarkdownBoldText(prefix)}** ·  \n${message}`;
     }
+
+    addThreadFormattedBodySeparator(content, prefix, message);
 
     return content;
   }
@@ -907,7 +909,6 @@
     return String(value || "")
       .replace(/\r\n/g, "\n")
       .replace(/[\u2028\u2029]/g, "\n")
-      .replaceAll(THREAD_PREVIEW_LINE_BREAK_MARKER, "")
       .replace(/\u00a0/g, " ")
       .split("\n")
       .map(line => line.replace(/[ \t]+/g, " ").trim())
@@ -936,7 +937,12 @@
     const value = normalizeDuplicateText(body);
     const splitAt = value.indexOf("\n");
 
-    return splitAt === -1 ? value : value.slice(splitAt + 1).trim();
+    if (splitAt !== -1) {
+      return value.slice(splitAt + 1).trim();
+    }
+
+    const markdownPreviewMatch = value.match(/^\*\*[\s\S]*?\*\*\s+·\s+.+?\s+·\s+([\s\S]*)$/);
+    return markdownPreviewMatch ? markdownPreviewMatch[1].trim() : value;
   }
 
   function duplicateSignature(check) {
