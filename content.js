@@ -24,6 +24,14 @@
   const PAGE_BRIDGE_DUPLICATE_RESPONSE = "matrix-mattermost-importer-duplicate-response";
   const PAGE_BRIDGE_DEFAULT_TIMEOUT_MS = 180000;
   const PAGE_BRIDGE_SEND_TIMEOUT_MS = 600000;
+  const THREAD_PREVIEW_LINE_BREAK_MARKER = "\u2063";
+  const THREAD_PREVIEW_SELECTOR = [
+    ".mx_ThreadSummary .mx_ThreadSummary_content.mx_EventPreview",
+    ".mx_ThreadSummary_content.mx_EventPreview",
+    ".mx_ThreadInfo_message-preview"
+  ].join(",");
+  const THREAD_PREVIEW_TIMESTAMP_PATTERN = /^(.+?·\s+\d{1,2}\.\d{1,2}\.\d{4},\s+\d{1,2}:\d{2})(?:\s+)(\S[\s\S]*)$/;
+  const THREAD_PREVIEW_BOLD_CHARACTER_PATTERN = /[\u{1d400}-\u{1d7ff}]/u;
   const MAIN_BUTTON_ICON = `
     <svg class="mmi-button-icon" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
       <path d="M16 13H25L34 30L43 13H52V39H43V28L36 39H32L25 28V39H16Z" fill="currentColor"/>
@@ -97,6 +105,7 @@
       requestPageSession();
       setInterval(requestPageSession, 2500);
       installRoomChangeWatcher();
+      installThreadPreviewLineBreakFixer();
     });
   }
 
@@ -552,6 +561,86 @@
     window.addEventListener("hashchange", closeOnRoomChange, true);
     window.addEventListener("popstate", closeOnRoomChange, true);
     setInterval(closeOnRoomChange, 1200);
+  }
+
+  function splitThreadPreviewText(value) {
+    const text = String(value || "");
+    const markerIndex = text.indexOf(THREAD_PREVIEW_LINE_BREAK_MARKER);
+
+    if (markerIndex !== -1) {
+      return {
+        prefix: text.slice(0, markerIndex).trimEnd(),
+        message: text.slice(markerIndex + THREAD_PREVIEW_LINE_BREAK_MARKER.length).trimStart()
+      };
+    }
+
+    const normalized = text.replace(/\r\n/g, "\n").replace(/[\u2028\u2029]/g, "\n");
+    const splitAt = normalized.indexOf("\n");
+
+    if (splitAt !== -1) {
+      return {
+        prefix: normalized.slice(0, splitAt).trimEnd(),
+        message: normalized.slice(splitAt + 1).trimStart()
+      };
+    }
+
+    const match = text.match(THREAD_PREVIEW_TIMESTAMP_PATTERN);
+    if (!match || !THREAD_PREVIEW_BOLD_CHARACTER_PATTERN.test(match[1])) {
+      return null;
+    }
+
+    return {
+      prefix: match[1],
+      message: match[2]
+    };
+  }
+
+  function fixThreadPreviewLineBreak(element) {
+    if (!element || element.querySelector("br[data-mmi-thread-preview-break]")) {
+      return;
+    }
+
+    const split = splitThreadPreviewText(element.textContent || "");
+    if (!split || !split.prefix || !split.message) {
+      return;
+    }
+
+    const lineBreak = document.createElement("br");
+    lineBreak.dataset.mmiThreadPreviewBreak = "true";
+    element.replaceChildren(
+      document.createTextNode(split.prefix),
+      lineBreak,
+      document.createTextNode(split.message)
+    );
+  }
+
+  function fixThreadPreviewLineBreaks(root = document) {
+    for (const element of root.querySelectorAll(THREAD_PREVIEW_SELECTOR)) {
+      fixThreadPreviewLineBreak(element);
+    }
+  }
+
+  function installThreadPreviewLineBreakFixer() {
+    let scheduled = false;
+
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+
+      requestAnimationFrame(() => {
+        scheduled = false;
+        fixThreadPreviewLineBreaks();
+      });
+    };
+
+    const observer = new MutationObserver(schedule);
+    observer.observe(document.documentElement, {
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+
+    schedule();
   }
 
   function createFloatingButton() {
@@ -1525,6 +1614,14 @@
     return `${userName(post.user_id)} · ${formatMattermostTime(post.create_at)}`;
   }
 
+  function lineSeparatedMessageBody(prefix, text) {
+    return `${prefix}\n${text}`;
+  }
+
+  function lineSeparatedMessageHtml(formattedPrefix, formattedMessage) {
+    return `<div>${formattedPrefix}</div><div>${formattedMessage}</div>`;
+  }
+
   function mattermostMeta(channel, post, extra = {}) {
     return {
       source: "mattermost-static-local-export",
@@ -1544,12 +1641,13 @@
   function makeTextItem(channel, post, options = {}) {
     const prefix = originalMessagePrefix(post);
     const message = convertCommonEmojiShortcodes(String(post.message || "").trim());
-    const body = message ? `${prefix}\n${message}` : `${prefix}\n${options.fallbackText || "[attachment message]"}`;
+    const body = lineSeparatedMessageBody(prefix, message || options.fallbackText || "[attachment message]");
 
     const formattedPrefix = `<strong>${escapeHtml(userName(post.user_id))}</strong> <span data-mx-color="#687076">· ${escapeHtml(formatMattermostTime(post.create_at))}</span>`;
-    const formattedBody = message
-      ? `${formattedPrefix}<br>${htmlFromPlainText(message)}`
-      : `${formattedPrefix}<br><em>${escapeHtml(options.fallbackText || "attachment message")}</em>`;
+    const formattedMessage = message
+      ? htmlFromPlainText(message)
+      : `<em>${escapeHtml(options.fallbackText || "attachment message")}</em>`;
+    const formattedBody = lineSeparatedMessageHtml(formattedPrefix, formattedMessage);
 
     return {
       kind: "text",
@@ -1623,7 +1721,11 @@
   }
 
   function importedContentFromBody(body) {
-    const value = String(body || "").replace(/\r\n/g, "\n").trim();
+    const value = String(body || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/[\u2028\u2029]/g, "\n")
+      .replaceAll(THREAD_PREVIEW_LINE_BREAK_MARKER, "")
+      .trim();
     const splitAt = value.indexOf("\n");
 
     return splitAt === -1 ? value : value.slice(splitAt + 1).trim();
@@ -2144,7 +2246,12 @@
         }
       };
 
-      await sendItemsViaPageBridge(room, [startItem], text => appendLog(root, text));
+      try {
+        await sendItemsViaPageBridge(room, [startItem], text => appendLog(root, text));
+      } catch (error) {
+        appendLog(root, `Warning: could not send import-start marker after retries: ${errorText(error)} Continuing with import.`);
+        publishFloatingImportLog(true);
+      }
 
       let processedPosts = 0;
       let processedImages = 0;
@@ -2332,7 +2439,12 @@
         }
       };
 
-      await sendItemsViaPageBridge(room, [finishItem], text => appendLog(root, text));
+      try {
+        await sendItemsViaPageBridge(room, [finishItem], text => appendLog(root, text));
+      } catch (error) {
+        appendLog(root, `Error: could not send import-finish marker after retries: ${errorText(error)}`);
+        publishFloatingImportLog(true);
+      }
 
       if (cancelled || state.cancelRequested) {
         updateImportProgress(root, processedPosts, stats.messages, processedImages, stats.images, "Cancelled.");

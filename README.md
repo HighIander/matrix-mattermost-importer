@@ -1,8 +1,8 @@
-# Matrix Gallery v0.31.0
+# Matrix Importer
 
 This extension imports chat data exported with the mattermost-exporter extension (https://github.com/HighIander/mattermost-exporter) into a single matrix chat and is compatible with the matrix-gallery extension (https://github.com/HighIander/matrix-gallery). 
 
-The extension injects an import button (labeled "MM") in the Matrix webpage at the bottom right. 
+The extension injects an import button (labeled "MM") in the Matrix webpage at the bottom right (you can move it anywhere you like). 
 The script tries to identify the corresponding team/channel in the export data based on the space/chat names, but the user can also select the corresponding channel manually. Start date for import can be chosen. The matrix chat is checked for duplicates before import. Supports images, other files, emojis and threads. 
 
 Licence: None (use as you like). No liability is taken by the author!

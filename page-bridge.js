@@ -20,6 +20,7 @@
   const UPLOAD_PROGRESS_HEARTBEAT_MS = 30000;
   const UPLOAD_RETRY_COUNT = 5;
   const SEND_RETRY_COUNT = 5;
+  const THREAD_PREVIEW_LINE_BREAK_MARKER = "\u2063";
 
   let lastSession = null;
   let installed = false;
@@ -738,40 +739,62 @@
     return content;
   }
 
-  function addThreadFallbackLabel(content, thread) {
+  function boldPlainTextCharacter(character) {
+    const codePoint = character.codePointAt(0);
+
+    if (codePoint >= 65 && codePoint <= 90) {
+      return String.fromCodePoint(0x1d400 + codePoint - 65);
+    }
+
+    if (codePoint >= 97 && codePoint <= 122) {
+      return String.fromCodePoint(0x1d41a + codePoint - 97);
+    }
+
+    if (codePoint >= 48 && codePoint <= 57) {
+      return String.fromCodePoint(0x1d7ce + codePoint - 48);
+    }
+
+    return character;
+  }
+
+  function boldPlainTextForThreadPreview(value) {
+    return Array.from(String(value || ""), boldPlainTextCharacter).join("");
+  }
+
+  function addThreadMainTimelinePreviewFallback(content, thread) {
     if (!thread?.rootEventId || !content || typeof content !== "object") {
       return content;
     }
 
-    const textLabel = "Thread:";
-    const htmlLabel = "<strong>Thread:</strong>";
     const msgtype = String(content.msgtype || "");
-
-    if (msgtype === "m.text" || msgtype === "m.notice" || content.formatted_body) {
-      const body = String(content.body || "");
-
-      if (!body.startsWith(`${textLabel}\n`)) {
-        content.body = `${textLabel}\n${body}`.trimEnd();
-      }
-
-      if (!content.formatted_body) {
-        content.format = "org.matrix.custom.html";
-        content.formatted_body = escapeHtml(body);
-      }
-
-      if (!String(content.formatted_body || "").startsWith(htmlLabel)) {
-        content.format = "org.matrix.custom.html";
-        content.formatted_body = `${htmlLabel}<br>${content.formatted_body || ""}`;
-      }
-
+    if (msgtype !== "m.text" && msgtype !== "m.notice") {
       return content;
     }
 
-    if ((msgtype === "m.image" || msgtype === "m.file") && content.body) {
-      const body = String(content.body || "");
-      if (!body.startsWith(`${textLabel} `)) {
-        content.body = `${textLabel} ${body}`;
-      }
+    const body = String(content.body || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/[\u2028\u2029]/g, "\n");
+    const splitAt = body.indexOf("\n");
+
+    if (splitAt === -1) {
+      return content;
+    }
+
+    const prefix = body.slice(0, splitAt).trimEnd();
+    const message = body.slice(splitAt + 1).trimStart();
+    const match = prefix.match(/^(.*?)\s+·\s+(.*)$/);
+
+    /*
+     * Element's main timeline thread summary renders later replies from body
+     * text instead of formatted_body. Keep formatted_body rich for the side
+     * panel, and make the plain fallback visually match it as closely as text
+     * allows. The marker is turned into a real <br> by the content script
+     * after Element flattens the preview text.
+     */
+    if (match) {
+      content.body = `${boldPlainTextForThreadPreview(match[1])} · ${match[2]}${THREAD_PREVIEW_LINE_BREAK_MARKER}\n${message}`;
+    } else {
+      content.body = `${boldPlainTextForThreadPreview(prefix)}${THREAD_PREVIEW_LINE_BREAK_MARKER}\n${message}`;
     }
 
     return content;
@@ -794,6 +817,21 @@
     return `mmi_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
 
+  function isLocalEchoStatusError(error) {
+    const message = errorMessage(error).toLowerCase();
+
+    return message.includes("updatependingeventstatus") ||
+      message.includes("not a local echo");
+  }
+
+  function authedRequest(http, method, path, query, data, opts) {
+    if (http.authedRequest.length >= 6) {
+      return http.authedRequest(undefined, method, path, query || {}, data, opts);
+    }
+
+    return http.authedRequest(method, path, query || {}, data, opts);
+  }
+
   async function sendRoomMessageViaHttp(client, roomId, content, txnId) {
     const http = client?.http || client?._http;
 
@@ -803,23 +841,42 @@
 
     const path = `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`;
 
-    return http.authedRequest(undefined, "PUT", path, undefined, content);
+    return authedRequest(http, "PUT", path, {}, content);
+  }
+
+  async function sendMessageViaSdk(client, roomId, content, thread) {
+    if (
+      thread?.rootEventId &&
+      String(thread.rootEventId).startsWith("$") &&
+      typeof client?.sendMessage === "function"
+    ) {
+      /*
+       * Current matrix-js-sdk versions have a thread-aware overload:
+       * sendMessage(roomId, threadId, content). Keep this as the primary path
+       * because Element's SDK path is what works across the widest set of builds.
+       */
+      return client.sendMessage(roomId, thread.rootEventId, cloneMessageContent(content));
+    }
+
+    return client.sendMessage(roomId, addThreadRelation(cloneMessageContent(content), thread));
   }
 
   async function sendMessageToRoom(client, roomId, content, thread, txnId = makeTxnId(client)) {
-    const eventContent = addThreadRelation(cloneMessageContent(content), thread);
+    try {
+      return await sendMessageViaSdk(client, roomId, content, thread);
+    } catch (error) {
+      if (!isLocalEchoStatusError(error) || !(client?.http || client?._http)) {
+        throw error;
+      }
 
-    if (client?.http || client?._http) {
       /*
-       * Bypass Element's local-echo bookkeeping. Some Element/matrix-js-sdk
-       * builds can throw "updatePendingEventStatus called on an event which is
-       * not a local echo" after sendMessage(), which aborts imports even though
-       * the importer only needs the homeserver response.
+       * Some Element/matrix-js-sdk builds can throw
+       * "updatePendingEventStatus called on an event which is not a local echo"
+       * from the SDK send path. Only for that specific local-echo bug, bypass
+       * Element's pending-event bookkeeping and send through Matrix HTTP.
        */
-      return sendRoomMessageViaHttp(client, roomId, eventContent, txnId);
+      return sendRoomMessageViaHttp(client, roomId, addThreadRelation(cloneMessageContent(content), thread), txnId);
     }
-
-    return client.sendMessage(roomId, eventContent);
   }
 
   async function sendMessageToRoomWithRetries(description, client, roomId, content, thread, requestId) {
@@ -849,6 +906,8 @@
   function normalizeDuplicateText(value) {
     return String(value || "")
       .replace(/\r\n/g, "\n")
+      .replace(/[\u2028\u2029]/g, "\n")
+      .replaceAll(THREAD_PREVIEW_LINE_BREAK_MARKER, "")
       .replace(/\u00a0/g, " ")
       .split("\n")
       .map(line => line.replace(/[ \t]+/g, " ").trim())
@@ -1245,7 +1304,7 @@
       content.formatted_body = `${content.formatted_body || escapeHtml(content.body)}${makeGalleryHtmlMetadata(item.gallery.id, "caption", -1, item.gallery.count)}`;
     }
 
-    const eventContent = addMattermostMetadata(addThreadFallbackLabel(content, threadContext), item.meta);
+    const eventContent = addThreadMainTimelinePreviewFallback(addMattermostMetadata(content, item.meta), threadContext);
     const result = await sendMessageToRoomWithRetries("sending text", client, roomId, eventContent, threadContext, requestId);
 
     return eventIdFromSendResult(result);
@@ -1360,7 +1419,7 @@
     }
 
     postProgress(requestId, `Sende Datei: ${content.body}`);
-    const eventContent = addMattermostMetadata(addThreadFallbackLabel(content, threadContext), item.meta);
+    const eventContent = addMattermostMetadata(content, item.meta);
     const result = await sendMessageToRoomWithRetries(`sending file ${content.body}`, client, roomId, eventContent, threadContext, requestId);
 
     return eventIdFromSendResult(result);
