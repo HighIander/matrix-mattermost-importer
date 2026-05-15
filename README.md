@@ -14,7 +14,7 @@ Licence: None (use as you like). No liability is taken by the author!
 - Automatic guessing of the Mattermost channel in the export data that corresponds to the active Matrix chat; user can manually choose the channel as well.
 - Detects duplicates and skips those messages.
 - Support for emojis, markup and threads.
-- Writes multiple images in Mattermost messages to Matrix in a form compatible with the matrix-gallery extension (https://github.com/HighIander/matrix-gallery) in order to view it nicely as used to from Mattermost!
+- Writes multiple images from Mattermost messages to Matrix in a form compatible with the matrix-gallery extension (https://github.com/HighIander/matrix-gallery) in order to view it nicely as you are used to from Mattermost! Check out the matrix-gallery extension also if you like to get back the thread view you are used from Mattermost!
 - Progress bar and cancel button during export.
 
 
